@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/ai-emergency-commander/decision_output.schema.json",
+  "title": "AI Emergency Commander Decision Output",
+  "type": "object",
+  "required": ["scenario_id", "run_mode", "weights_used", "zone_assessment", "assignments", "routes", "replan_log"],
+  "properties": {
+    "scenario_id": {"type": "string"},
+    "run_mode": {"enum": ["fixed", "learned"]},
+    "weights_used": {"type": "object"},
+    "zone_assessment": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["zone_id", "node_id", "trapped_prob", "passability_prob", "life_risk", "priority_score"],
+        "properties": {
+          "zone_id": {"type": "string"},
+          "node_id": {"type": "string"},
+          "trapped_prob": {"type": "number", "minimum": 0, "maximum": 1},
+          "passability_prob": {"type": "number", "minimum": 0, "maximum": 1},
+          "life_risk": {"type": "number", "minimum": 0, "maximum": 1},
+          "priority_score": {"type": "number", "minimum": 0, "maximum": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "assignments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["unit_id", "target_zone", "mission_type", "expected_utility", "reason"],
+        "properties": {
+          "unit_id": {"type": "string"},
+          "target_zone": {"type": "string"},
+          "mission_type": {"enum": ["rescue", "reconnaissance"]},
+          "expected_utility": {"type": "number"},
+          "reason": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "routes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["unit_id", "target_zone", "path", "road_ids", "eta", "path_risk"],
+        "properties": {
+          "unit_id": {"type": "string"},
+          "target_zone": {"type": "string"},
+          "path": {"type": "array", "items": {"type": "string"}},
+          "road_ids": {"type": "array", "items": {"type": "string"}},
+          "eta": {"type": "number", "minimum": 0},
+          "path_risk": {"type": "number", "minimum": 0, "maximum": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "replan_log": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["trigger_event", "old_plan", "new_plan", "reason"],
+        "properties": {
+          "trigger_event": {"type": "object"},
+          "old_plan": {"type": "object"},
+          "new_plan": {"type": "object"},
+          "reason": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
