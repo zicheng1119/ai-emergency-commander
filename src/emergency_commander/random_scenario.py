@@ -7,7 +7,9 @@ from typing import Any
 from emergency_commander.contracts import validate_scenario
 
 
-ZONE_IDS = ("A", "B", "C")
+ZONE_IDS = ("A", "B", "C", "D", "E", "F")
+GRID_ROWS = 3
+GRID_COLUMNS = 6
 
 
 def _round_probability(value: float) -> float:
@@ -74,22 +76,31 @@ def _generate_nodes_and_zones(
     rng: random.Random,
 ) -> tuple[dict[str, dict[str, float]], list[dict[str, Any]]]:
     nodes: dict[str, dict[str, float]] = {
-        "HQ": {"x": 0.0, "y": 0.0},
-        "HOSPITAL": {"x": -3.0, "y": 0.0},
-        "AIR_RELAY": {"x": 4.0, "y": 4.5},
+        "HQ": {"x": -4.0, "y": 4.0},
+        "HOSPITAL": {"x": -8.0, "y": 4.0},
+        "AIR_RELAY": {"x": 10.0, "y": 15.0},
     }
+    for row in range(GRID_ROWS):
+        for column in range(GRID_COLUMNS):
+            nodes[f"J{row}{column}"] = {
+                "x": round(column * 4.0 + rng.uniform(-0.32, 0.32), 3),
+                "y": round(row * 4.0 + rng.uniform(-0.32, 0.32), 3),
+            }
+
     zones: list[dict[str, Any]] = []
-    anchors = ((8.0, 0.5), (3.0, 7.0), (9.0, 7.0))
+    anchors = (
+        (2.0, -3.0),
+        (18.0, -3.0),
+        (-2.5, 6.0),
+        (22.5, 6.0),
+        (2.0, 11.0),
+        (18.0, 11.0),
+    )
     for zone_id, (base_x, base_y) in zip(ZONE_IDS, anchors):
         node_id = f"ZONE_{zone_id}"
-        relay_id = f"RELAY_{zone_id}"
-        x = round(base_x + rng.uniform(-1.0, 1.0), 3)
-        y = round(base_y + rng.uniform(-1.0, 1.0), 3)
+        x = round(base_x + rng.uniform(-0.45, 0.45), 3)
+        y = round(base_y + rng.uniform(-0.45, 0.45), 3)
         nodes[node_id] = {"x": x, "y": y}
-        nodes[relay_id] = {
-            "x": round(x * 0.48 + rng.uniform(-0.4, 0.4), 3),
-            "y": round(y * 0.48 + rng.uniform(-0.4, 0.4), 3),
-        }
         hazard = rng.uniform(0.42, 0.94)
         observations = {
             "hazard_intensity": _round_probability(hazard),
@@ -130,9 +141,25 @@ def _road(
     rng: random.Random,
     *,
     air: bool = False,
+    risk_profile: str = "mixed",
 ) -> dict[str, Any]:
     distance = _distance(nodes, start, end)
     pace = rng.uniform(0.72, 1.15) if not air else rng.uniform(0.28, 0.46)
+    risk = _risk(rng, air=air)
+    if not air and risk_profile == "safe":
+        risk = {
+            "fire": _round_probability(rng.uniform(0.02, 0.13)),
+            "damage": _round_probability(rng.uniform(0.01, 0.12)),
+            "congestion": _round_probability(rng.uniform(0.01, 0.14)),
+            "secondary_disaster": _round_probability(rng.uniform(0.01, 0.10)),
+        }
+    elif not air and risk_profile == "hazardous":
+        risk = {
+            "fire": _round_probability(rng.uniform(0.48, 0.68)),
+            "damage": _round_probability(rng.uniform(0.28, 0.52)),
+            "congestion": _round_probability(rng.uniform(0.45, 0.72)),
+            "secondary_disaster": _round_probability(rng.uniform(0.22, 0.48)),
+        }
     return {
         "road_id": road_id,
         "from": start,
@@ -141,24 +168,70 @@ def _road(
         "travel_time_base": round(max(0.4, distance * pace), 3),
         "status": "open",
         "bidirectional": True,
-        "risk": _risk(rng, air=air),
+        "risk": risk,
     }
 
 
 def _generate_ground_roads(
     nodes: dict[str, dict[str, float]], rng: random.Random
 ) -> list[dict[str, Any]]:
-    roads = [_road("R_HOSPITAL_HQ", "HOSPITAL", "HQ", nodes, rng)]
-    for zone_id in ZONE_IDS:
-        zone = f"ZONE_{zone_id}"
-        relay = f"RELAY_{zone_id}"
-        roads.extend(
-            [
-                _road(f"R_HQ_{zone_id}_DIRECT", "HQ", zone, nodes, rng),
-                _road(f"R_HQ_RELAY_{zone_id}", "HQ", relay, nodes, rng),
-                _road(f"R_RELAY_{zone_id}_{zone_id}", relay, zone, nodes, rng),
-            ]
-        )
+    roads = [
+        _road("R_HOSPITAL_HQ", "HOSPITAL", "HQ", nodes, rng, risk_profile="safe"),
+        _road("R_HQ_J00", "HQ", "J00", nodes, rng, risk_profile="safe"),
+        _road("R_HQ_J10", "HQ", "J10", nodes, rng, risk_profile="safe"),
+    ]
+
+    for row in range(GRID_ROWS):
+        for column in range(GRID_COLUMNS - 1):
+            profile = "hazardous" if row == 1 and 1 <= column <= 3 else "safe"
+            roads.append(
+                _road(
+                    f"R_J{row}{column}_J{row}{column + 1}",
+                    f"J{row}{column}",
+                    f"J{row}{column + 1}",
+                    nodes,
+                    rng,
+                    risk_profile=profile,
+                )
+            )
+
+    omitted_verticals = {(0, 1), (1, 4)}
+    for row in range(GRID_ROWS - 1):
+        for column in range(GRID_COLUMNS):
+            if (row, column) in omitted_verticals:
+                continue
+            profile = "hazardous" if column in {2, 3} else "safe"
+            roads.append(
+                _road(
+                    f"R_J{row}{column}_J{row + 1}{column}",
+                    f"J{row}{column}",
+                    f"J{row + 1}{column}",
+                    nodes,
+                    rng,
+                    risk_profile=profile,
+                )
+            )
+
+    zone_connections = {
+        "A": ("J00", "J01"),
+        "B": ("J04", "J05"),
+        "C": ("J10", "J20"),
+        "D": ("J15", "J25"),
+        "E": ("J20", "J21"),
+        "F": ("J24", "J25"),
+    }
+    for zone_id, junctions in zone_connections.items():
+        for index, junction in enumerate(junctions, start=1):
+            roads.append(
+                _road(
+                    f"R_{junction}_ZONE_{zone_id}_{index}",
+                    junction,
+                    f"ZONE_{zone_id}",
+                    nodes,
+                    rng,
+                    risk_profile="mixed",
+                )
+            )
     return roads
 
 
@@ -205,6 +278,17 @@ def _generate_units(rng: random.Random) -> list[dict[str, Any]]:
             "constraints": {"max_fire_risk": 0.72, "min_passability": 0.45},
         },
         {
+            "unit_id": "RescueCar-3",
+            "type": "rescue_car",
+            "start_node": "HQ",
+            "speed": round(rng.uniform(1.12, 1.42), 3),
+            "can_transport": True,
+            "capacity": 3,
+            "service_time": 0.8,
+            "resource_cost": 0.72,
+            "constraints": {"max_fire_risk": 0.64, "min_passability": 0.50},
+        },
+        {
             "unit_id": "Drone-1",
             "type": "drone",
             "start_node": "HQ",
@@ -213,6 +297,17 @@ def _generate_units(rng: random.Random) -> list[dict[str, Any]]:
             "capacity": 0,
             "service_time": 0.5,
             "resource_cost": 0.25,
+            "constraints": {},
+        },
+        {
+            "unit_id": "Drone-2",
+            "type": "drone",
+            "start_node": "HQ",
+            "speed": round(rng.uniform(2.1, 2.6), 3),
+            "can_transport": False,
+            "capacity": 0,
+            "service_time": 0.35,
+            "resource_cost": 0.34,
             "constraints": {},
         },
     ]

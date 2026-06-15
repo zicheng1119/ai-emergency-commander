@@ -121,10 +121,13 @@ def test_fixed_inference_ranks_high_sos_zone_first():
     assessments = assess_zones(scenario)
 
     by_id = {item["zone_id"]: item for item in assessments}
-    assert by_id["A"]["trapped_prob"] == pytest.approx(0.8025)
-    assert by_id["A"]["passability_prob"] == pytest.approx(0.4775)
+    assert by_id["A"]["trapped_prob"] > by_id["B"]["trapped_prob"]
+    assert 0.0 < by_id["A"]["passability_prob"] < 1.0
     assert by_id["A"]["priority_score"] > by_id["B"]["priority_score"]
     assert all(0.0 <= item["priority_score"] <= 1.0 for item in assessments)
+    assert by_id["A"]["inference_model"] == "expert_cpt"
+    assert by_id["A"]["bayesian_evidence"]["sos_signal"] == "high"
+    assert by_id["A"]["trapped_explanation"]["contributions"]
 
 
 def test_normalize_scenario_rejects_invalid_road_risk():

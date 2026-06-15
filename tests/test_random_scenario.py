@@ -34,10 +34,13 @@ def test_random_scenario_is_reproducible_and_contract_valid():
     assert first != other
     validate_scenario(first)
     assert first["events"] == []
-    assert len(first["zones"]) == 3
+    assert len(first["zones"]) == 6
+    assert len(first["nodes"]) >= 27
+    assert 30 <= len(first["roads"]) <= 40
+    assert 6 <= len(first["air_routes"]) <= 9
     unit_types = [unit["type"] for unit in first["units"]]
-    assert unit_types.count("rescue_car") == 2
-    assert unit_types.count("drone") == 1
+    assert unit_types.count("rescue_car") == 3
+    assert unit_types.count("drone") == 2
 
 
 def test_every_single_ground_road_failure_keeps_zones_reachable():

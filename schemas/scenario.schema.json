@@ -11,6 +11,10 @@
     "run_mode": {"enum": ["fixed", "learned"]},
     "command_center": {"$ref": "#/$defs/nodeReference"},
     "hospital": {"$ref": "#/$defs/nodeReference"},
+    "nodes": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/coordinates"}
+    },
     "config": {
       "type": "object",
       "required": ["weights", "thresholds"],
@@ -41,6 +45,7 @@
     },
     "zones": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/zone"}},
     "roads": {"type": "array", "items": {"$ref": "#/$defs/road"}},
+    "air_routes": {"type": "array", "items": {"$ref": "#/$defs/road"}},
     "units": {"type": "array", "items": {"$ref": "#/$defs/unit"}},
     "events": {"type": "array", "items": {"$ref": "#/$defs/event"}}
   },
@@ -51,6 +56,15 @@
       "type": "object",
       "required": ["node_id"],
       "properties": {"node_id": {"type": "string", "minLength": 1}},
+      "additionalProperties": false
+    },
+    "coordinates": {
+      "type": "object",
+      "required": ["x", "y"],
+      "properties": {
+        "x": {"type": "number"},
+        "y": {"type": "number"}
+      },
       "additionalProperties": false
     },
     "trappedWeights": {
@@ -104,7 +118,8 @@
         "beta": {"type": "number", "minimum": 0},
         "gamma": {"type": "number", "minimum": 0},
         "delta": {"type": "number", "minimum": 0},
-        "epsilon": {"type": "number", "minimum": 0}
+        "epsilon": {"type": "number", "minimum": 0},
+        "zeta": {"type": "number", "minimum": 0}
       },
       "additionalProperties": false
     },
@@ -132,6 +147,8 @@
         "congestion": {"$ref": "#/$defs/probability"},
         "time_urgency": {"$ref": "#/$defs/probability"},
         "drone_confidence": {"$ref": "#/$defs/probability"}
+        ,"hazard_intensity": {"$ref": "#/$defs/probability"}
+        ,"drone_road_report": {"enum": ["blocked", "uncertain", "open"]}
       },
       "additionalProperties": false
     },
@@ -182,6 +199,9 @@
         "start_node": {"type": "string", "minLength": 1},
         "speed": {"type": "number", "exclusiveMinimum": 0},
         "can_transport": {"type": "boolean"},
+        "capacity": {"type": "integer", "minimum": 0},
+        "service_time": {"type": "number", "minimum": 0},
+        "resource_cost": {"$ref": "#/$defs/probability"},
         "constraints": {
           "type": "object",
           "properties": {
@@ -200,6 +220,7 @@
         "event_id": {"type": "string", "minLength": 1},
         "event_type": {"enum": ["road_collapse", "drone_update", "new_sos", "fire_spread"]},
         "trigger_step": {"type": "integer", "minimum": 0},
+        "elapsed_minutes": {"type": "number", "minimum": 0},
         "target_id": {"type": "string", "minLength": 1},
         "changes": {"type": "object", "minProperties": 1},
         "description": {"type": "string"}
@@ -208,4 +229,3 @@
     }
   }
 }
-

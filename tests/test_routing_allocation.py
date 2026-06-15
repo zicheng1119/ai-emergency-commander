@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 import pytest
 
 from emergency_commander.allocation import allocate_tasks, build_utility_matrix
@@ -105,6 +107,12 @@ def allocation_scenario():
         )
 
     return {
+        "nodes": {
+            "HQ": {"x": 0.0, "y": 0.0},
+            "ZONE_A": {"x": 5.0, "y": 0.0},
+            "ZONE_B": {"x": 0.0, "y": 4.0},
+            "ZONE_C": {"x": 4.0, "y": 4.0},
+        },
         "config": {
             "weights": {
                 "trapped": {"sos": 0.35, "collapse": 0.30, "human_activity": 0.20, "smoke": 0.15},
@@ -121,6 +129,11 @@ def allocation_scenario():
             road("to_a", "HQ", "ZONE_A", 5.0, fire=0.2),
             road("to_b", "HQ", "ZONE_B", 4.0),
             road("to_c", "HQ", "ZONE_C", 3.0, fire=0.8, damage=0.6),
+        ],
+        "air_routes": [
+            road("air_to_a", "HQ", "ZONE_A", 2.5),
+            road("air_to_b", "HQ", "ZONE_B", 2.0),
+            road("air_to_c", "HQ", "ZONE_C", 2.2),
         ],
         "units": [
             {
@@ -163,3 +176,83 @@ def test_allocator_sends_drone_to_high_risk_low_accessibility_zone():
     assert by_unit["Drone-1"]["mission_type"] == "reconnaissance"
     assert {by_unit["RescueCar-1"]["target_zone"], by_unit["RescueCar-2"]["target_zone"]} == {"A", "B"}
     assert all(item["target_zone"] != "C" for item in assignments if item["mission_type"] == "rescue")
+
+
+def test_allocator_exposes_ranked_enumeration_trace_when_requested():
+    scenario = allocation_scenario()
+    matrix = build_utility_matrix(scenario, assess_zones(scenario))
+
+    result = allocate_tasks(scenario, matrix, include_trace=True)
+
+    assignments = result["assignments"]
+    trace = result["trace"]
+    assert trace["considered"] > 0
+    assert trace["duplicate_zone_rejections"] > 0
+    assert trace["ranked_combinations"]
+    assert trace["winning_total"] == pytest.approx(
+        sum(item["expected_utility"] for item in assignments)
+    )
+    assert trace["ranked_combinations"][0]["total"] == trace["winning_total"]
+
+
+def test_utility_candidate_exposes_signed_breakdown_and_explanation():
+    scenario = allocation_scenario()
+    scenario["config"]["weights"]["utility"]["zeta"] = 0.10
+    scenario["units"][0]["resource_cost"] = 0.55
+    assessments = assess_zones(scenario)
+
+    matrix = build_utility_matrix(scenario, assessments)
+    candidate = next(
+        item
+        for item in matrix
+        if item["unit_id"] == "RescueCar-1" and item["target_zone"] == "A"
+    )
+
+    assert candidate["resource_cost"] == pytest.approx(0.55)
+    assert set(candidate["utility_inputs"]) == {
+        "trapped_prob",
+        "life_risk",
+        "accessibility",
+        "arrival_time_normalized",
+        "path_risk",
+        "resource_cost",
+    }
+    assert set(candidate["utility_breakdown"]) == {
+        "trapped_benefit",
+        "life_risk_benefit",
+        "accessibility_benefit",
+        "arrival_time_cost",
+        "path_risk_cost",
+        "resource_cost",
+    }
+    assert sum(candidate["utility_breakdown"].values()) == pytest.approx(
+        candidate["expected_utility"], abs=1e-6
+    )
+    assert "RescueCar-1" in candidate["explanation"]
+    assert "A区" in candidate["explanation"]
+    assert "资源" in candidate["explanation"]
+
+
+def test_resource_cost_penalty_lowers_expected_utility_by_zeta_weight():
+    scenario = allocation_scenario()
+    scenario["config"]["weights"]["utility"]["zeta"] = 0.20
+    low_cost = deepcopy(scenario["units"][0])
+    low_cost["unit_id"] = "LowCostCar"
+    low_cost["resource_cost"] = 0.20
+    high_cost = deepcopy(low_cost)
+    high_cost["unit_id"] = "HighCostCar"
+    high_cost["resource_cost"] = 0.80
+    scenario["units"] = [low_cost, high_cost]
+    assessments = assess_zones(scenario)
+
+    matrix = build_utility_matrix(scenario, assessments)
+    candidates = {
+        item["unit_id"]: item
+        for item in matrix
+        if item["target_zone"] == "A" and item["feasible"]
+    }
+
+    assert (
+        candidates["LowCostCar"]["expected_utility"]
+        - candidates["HighCostCar"]["expected_utility"]
+    ) == pytest.approx(0.20 * (0.80 - 0.20), abs=1e-6)

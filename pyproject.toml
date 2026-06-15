@@ -7,7 +7,16 @@ name = "ai-emergency-commander"
 version = "0.1.0"
 description = "Explainable rescue decision pipeline with fixed and learned probability weights"
 requires-python = ">=3.11"
-dependencies = ["numpy>=1.26"]
+dependencies = [
+  "jsonschema>=4.23",
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "plotly>=5.24",
+  "PyYAML>=6.0",
+  "requests>=2.32",
+  "scikit-learn>=1.5",
+  "streamlit>=1.40",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
@@ -21,4 +30,3 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-

@@ -1,61 +1,41 @@
 # Agent Handoff
 
-Last updated: 2026-06-15
+Last updated: 2026-06-16
 
-## Objective
+## Status
 
-Implement `计划.md`: a fixed-weight and learned-weight emergency rescue algorithm pipeline with a shared JSON interface.
+P0/P1 upgrade is implemented on `feature/p0-p1-bayesian-demo`:
 
-## Current Status
+- Full 11-node discrete Bayesian network with exact inference and evidence attribution.
+- Expert CPT baseline and learned CPT variant with the same graph structure.
+- Official USGS download, checksum metadata, hybrid-data provenance, five-fold evaluation, calibration and missing-evidence tests.
+- Coordinate-aware risk A*, independent ground/air graphs, constrained assignment and stateful rescue simulation.
+- Resource-aware expected utility with six-term contribution breakdowns, candidate audit matrices and deterministic explanations.
+- Runtime JSON Schema validation at both pipeline boundaries.
+- Streamlit visual demo with risk-layer map, event controls, utility decision console, evidence, metrics and downloadable output.
 
-- Phase 1 complete: project scaffold, input validation, and fixed inference.
-- Phase 2 complete: risk-aware A*, expected utility matrix, and constrained global assignment.
-- Phase 3 complete: four supported events, dynamic replanning, and unified output.
-- Phase 4 complete: deterministic synthetic data and supervised probability-weight learning.
-- Phase 5 complete: CLI, JSON Schemas, standard scenario, generated artifacts, and dual-mode outputs.
-- Verification: 16 tests pass; compile, CLI, JSON parsing, and independent acceptance assertions pass.
-- The workspace is not a Git repository, so there is no branch or worktree state to preserve.
-- The authoritative `计划.md` learns probability weights only. Utility and A* weights remain configurable but fixed.
+## Verification
 
-## Module Map
+- `40 passed` with `.venv/bin/pytest -q`.
+- Full experiment: 50,000 samples, 5 folds, 92.566 seconds, 121.632 MB peak traced memory on M3 / 16GB.
+- Learned CPT improves trapped F1 from 0.3354 to 0.4041 and road ROC-AUC from 0.7740 to 0.7766.
+- Fixed and learned v2 outputs both pass `schemas/decision_output.schema.json`.
 
-- `src/emergency_commander/input_adapter.py`: runtime validation and normalization of Qwen/preset JSON.
-- `src/emergency_commander/inference.py`: trapped probability, passability, life risk, and priority.
-- `src/emergency_commander/routing.py`: risk-aware A* with blocked-road and vehicle fire constraints.
-- `src/emergency_commander/allocation.py`: utility candidates and small-scale global assignment enumeration.
-- `src/emergency_commander/replanning.py`: event application for collapse, drone updates, SOS, and fire spread.
-- `src/emergency_commander/pipeline.py`: shared fixed/learned decision output and replan history.
-- `src/emergency_commander/training.py`: synthetic data, supervised fitting, Brier metrics, and comparisons.
-- `src/emergency_commander/cli.py`: generate, train, run, and compare commands.
+## Important Files
 
-## Deliverables
+- `app.py`: visual demo entry point.
+- `src/emergency_commander/bayesian_network.py`: exact BN inference and CPT fitting.
+- `src/emergency_commander/experiment.py`: hybrid-data and cross-validation pipeline.
+- `src/emergency_commander/pipeline.py`: stateful end-to-end decision pipeline.
+- `artifacts/full_bayesian_experiment/experiment_report.md`: experiment summary.
+- `examples/decision_output_*_v2.json`: synchronized demo outputs.
 
-- Standard input: `examples/scenario_input.json`
-- Fixed output: `examples/decision_output_fixed.json` and root `decision_output.json`
-- Learned output: `examples/decision_output_learned.json`
-- Input/output contracts: `schemas/*.schema.json`
-- Training data: `data/synthetic_training.json` (300 samples)
-- Showcase data: `data/showcase_cases.json` (6 reviewed cases)
-- Learned parameters: `artifacts/learned_weights.json`
-- Validation metrics: `artifacts/training_metrics.json`
-- Case comparison: `artifacts/model_comparison.json`
-
-## Verified Results
-
-- Validation mean Brier: fixed `0.22148899`, learned `0.21290494`.
-- Showcase mean Brier: fixed `0.12266042`, learned `0.0741002`; 6/6 cases improve.
-- Initial fixed assignment: Car-1 -> A, Car-2 -> B, Drone-1 -> C.
-- Road collapse replans Car-1 from direct route to `HQ -> X -> ZONE_A`.
-- Drone update makes C reachable and reassigns Car-1 to C.
-
-## Commands
+## Reproduction
 
 ```bash
-python3 -m pytest -q
-python3 run.py --help
-python3 run.py run --scenario examples/scenario_input.json --mode fixed --output decision_output.json
+.venv/bin/pip install -e '.[dev]'
+.venv/bin/pytest -q
+.venv/bin/streamlit run app.py
 ```
 
-## Next Step
-
-The plan is complete. A future agent can integrate `run_pipeline()` into Streamlit/Qwen adapters without changing the JSON contract. If the accepted scope changes to learn utility or A* coefficients, add separate training artifacts rather than changing the existing probability-weight file.
+The generated `hybrid_dataset.jsonl` is intentionally ignored because it is reproducible and about 27MB. Public source rows, metadata, learned CPT, metrics, runtime and report remain versioned.

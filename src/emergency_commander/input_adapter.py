@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from emergency_commander.contracts import ContractValidationError, validate_scenario
 from emergency_commander.replanning import SUPPORTED_EVENT_TYPES
 
 
@@ -29,7 +30,7 @@ WEIGHT_FIELDS = {
     "passability": ("road_damage", "fire_risk", "congestion", "drone_confidence"),
     "life_risk": ("fire", "trapped_prob", "time_urgency"),
     "priority": ("trapped_prob", "life_risk", "time_urgency", "accessibility"),
-    "utility": ("alpha", "beta", "gamma", "delta", "epsilon"),
+    "utility": ("alpha", "beta", "gamma", "delta", "epsilon", "zeta"),
     "astar_risk": ("fire", "damage", "congestion", "secondary"),
 }
 
@@ -77,7 +78,9 @@ def normalize_scenario(raw: dict[str, Any]) -> dict[str, Any]:
     scenario["run_mode"] = mode
 
     scenario.setdefault("hospital", {})
+    scenario.setdefault("nodes", {})
     scenario.setdefault("roads", [])
+    scenario.setdefault("air_routes", [])
     scenario.setdefault("units", [])
     scenario.setdefault("events", [])
     zones = _require(scenario, "zones", "scenario")
@@ -99,10 +102,26 @@ def normalize_scenario(raw: dict[str, Any]) -> dict[str, Any]:
                 f"{context}.observations.{field}",
             )
         zone.setdefault("labels", {})
+        if "hazard_intensity" in observations:
+            observations["hazard_intensity"] = _unit_interval(
+                observations["hazard_intensity"],
+                f"{context}.observations.hazard_intensity",
+            )
+        if observations.get("drone_road_report") not in {
+            None,
+            "blocked",
+            "uncertain",
+            "open",
+        }:
+            raise ScenarioValidationError(
+                f"{context}.observations.drone_road_report is invalid"
+            )
 
     weights = _require(scenario["config"], "weights", "config")
     for group, fields in WEIGHT_FIELDS.items():
         group_weights = _require(weights, group, "config.weights")
+        if group == "utility":
+            group_weights.setdefault("zeta", 0.10)
         for field in fields:
             group_weights[field] = _nonnegative_number(
                 _require(group_weights, field, f"config.weights.{group}"),
@@ -112,29 +131,52 @@ def normalize_scenario(raw: dict[str, Any]) -> dict[str, Any]:
     scenario["config"]["thresholds"].setdefault("car_min_passability", 0.45)
     scenario["config"]["thresholds"].setdefault("drone_recon_priority_risk", 0.70)
 
+    for node_id, coordinates in scenario["nodes"].items():
+        if not isinstance(coordinates, dict):
+            raise ScenarioValidationError(f"nodes.{node_id} must be an object")
+        for axis in ("x", "y"):
+            value = _require(coordinates, axis, f"nodes.{node_id}")
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ScenarioValidationError(f"nodes.{node_id}.{axis} must be numeric")
+            coordinates[axis] = float(value)
+
     seen_road_ids: set[str] = set()
-    for index, road in enumerate(scenario["roads"]):
-        context = f"roads[{index}]"
-        road_id = _require(road, "road_id", context)
-        if road_id in seen_road_ids:
-            raise ScenarioValidationError(f"duplicate road_id '{road_id}'")
-        seen_road_ids.add(road_id)
-        _require(road, "from", context)
-        _require(road, "to", context)
-        road["distance"] = _positive_number(_require(road, "distance", context), f"{context}.distance")
-        road["travel_time_base"] = _positive_number(
-            _require(road, "travel_time_base", context), f"{context}.travel_time_base"
-        )
-        status = road.setdefault("status", "open")
-        if status not in {"open", "blocked"}:
-            raise ScenarioValidationError(f"{context}.status must be 'open' or 'blocked'")
-        road.setdefault("bidirectional", True)
-        risk = _require(road, "risk", context)
-        for field in ROAD_RISK_FIELDS:
-            risk[field] = _unit_interval(
-                _require(risk, field, f"{context}.risk"), f"{context}.risk.{field}"
+    for collection_name in ("roads", "air_routes"):
+        for index, road in enumerate(scenario[collection_name]):
+            context = f"{collection_name}[{index}]"
+            road_id = _require(road, "road_id", context)
+            if road_id in seen_road_ids:
+                raise ScenarioValidationError(f"duplicate road_id '{road_id}'")
+            seen_road_ids.add(road_id)
+            start_node = _require(road, "from", context)
+            end_node = _require(road, "to", context)
+            if scenario["nodes"] and (
+                start_node not in scenario["nodes"]
+                or end_node not in scenario["nodes"]
+            ):
+                raise ScenarioValidationError(
+                    f"{context} references a node without coordinates"
+                )
+            road["distance"] = _positive_number(
+                _require(road, "distance", context), f"{context}.distance"
             )
-        road.setdefault("labels", {})
+            road["travel_time_base"] = _positive_number(
+                _require(road, "travel_time_base", context),
+                f"{context}.travel_time_base",
+            )
+            status = road.setdefault("status", "open")
+            if status not in {"open", "blocked"}:
+                raise ScenarioValidationError(
+                    f"{context}.status must be 'open' or 'blocked'"
+                )
+            road.setdefault("bidirectional", True)
+            risk = _require(road, "risk", context)
+            for field in ROAD_RISK_FIELDS:
+                risk[field] = _unit_interval(
+                    _require(risk, field, f"{context}.risk"),
+                    f"{context}.risk.{field}",
+                )
+            road.setdefault("labels", {})
 
     seen_unit_ids: set[str] = set()
     for index, unit in enumerate(scenario["units"]):
@@ -154,6 +196,19 @@ def normalize_scenario(raw: dict[str, Any]) -> dict[str, Any]:
         for field in ("max_fire_risk", "min_passability"):
             if field in constraints:
                 constraints[field] = _unit_interval(constraints[field], f"{context}.constraints.{field}")
+        capacity = unit.setdefault("capacity", 4 if unit_type == "rescue_car" else 0)
+        if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 0:
+            raise ScenarioValidationError(f"{context}.capacity must be a nonnegative integer")
+        unit["service_time"] = _nonnegative_number(
+            unit.setdefault("service_time", 1.0 if unit_type == "rescue_car" else 0.5),
+            f"{context}.service_time",
+        )
+        unit["resource_cost"] = _unit_interval(
+            unit.setdefault("resource_cost", 0.55 if unit_type == "rescue_car" else 0.25),
+            f"{context}.resource_cost",
+        )
+        if scenario["nodes"] and unit["start_node"] not in scenario["nodes"]:
+            raise ScenarioValidationError(f"{context}.start_node has no coordinates")
 
     seen_event_ids: set[str] = set()
     for index, event in enumerate(scenario["events"]):
@@ -169,5 +224,13 @@ def normalize_scenario(raw: dict[str, Any]) -> dict[str, Any]:
         changes = _require(event, "changes", context)
         if not isinstance(changes, dict) or not changes:
             raise ScenarioValidationError(f"{context}.changes must be a non-empty object")
+        elapsed = event.setdefault("elapsed_minutes", 0.0)
+        event["elapsed_minutes"] = _nonnegative_number(
+            elapsed, f"{context}.elapsed_minutes"
+        )
 
+    try:
+        validate_scenario(scenario)
+    except ContractValidationError as error:
+        raise ScenarioValidationError(f"scenario schema violation: {error}") from error
     return scenario
