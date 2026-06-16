@@ -80,6 +80,66 @@ def test_rescue_route_rejects_road_above_unit_fire_limit():
         )
 
 
+def test_utility_matrix_uses_high_fire_route_when_safe_route_is_blocked():
+    scenario = allocation_scenario()
+    scenario["zones"] = [
+        {
+            "zone_id": "A",
+            "node_id": "ZONE_A",
+            "observations": {
+                "sos_signal": 0.90,
+                "building_collapse": 0.80,
+                "smoke": 0.20,
+                "fire": 0.20,
+                "road_damage": 0.10,
+                "human_activity": 0.60,
+                "congestion": 0.10,
+                "time_urgency": 0.80,
+                "drone_confidence": 0.0,
+            },
+        }
+    ]
+    scenario["nodes"] = {
+        "HQ": {"x": 0.0, "y": 0.0},
+        "SAFE": {"x": 1.0, "y": 1.0},
+        "ZONE_A": {"x": 2.0, "y": 0.0},
+    }
+    scenario["roads"] = [
+        road("safe_detour_1", "HQ", "SAFE", 1.0, fire=0.1, status="blocked"),
+        road("safe_detour_2", "SAFE", "ZONE_A", 1.0, fire=0.1),
+        road("burning_direct", "HQ", "ZONE_A", 1.4, fire=0.95),
+    ]
+    scenario["air_routes"] = []
+    scenario["units"] = [
+        {
+            "unit_id": "RescueCar-1",
+            "type": "rescue_car",
+            "start_node": "HQ",
+            "speed": 1.0,
+            "can_transport": True,
+            "constraints": {"max_fire_risk": 0.70, "min_passability": 0.45},
+        }
+    ]
+    assessments = [
+        {
+            "zone_id": "A",
+            "node_id": "ZONE_A",
+            "trapped_prob": 0.8,
+            "passability_prob": 0.9,
+            "life_risk": 0.6,
+            "priority_score": 0.8,
+        }
+    ]
+
+    matrix = build_utility_matrix(scenario, assessments)
+
+    candidate = matrix[0]
+    assert candidate["feasible"]
+    assert candidate["route"]["road_ids"] == ["burning_direct"]
+    assert candidate["route"]["risk_policy"] == "relaxed_fire_limit"
+    assert candidate["reason"] == "feasible_with_risk_override"
+
+
 def allocation_scenario():
     observations = {
         "A": (0.95, 0.85, 0.55, 0.50, 0.20, 0.80),
@@ -176,6 +236,35 @@ def test_allocator_sends_drone_to_high_risk_low_accessibility_zone():
     assert by_unit["Drone-1"]["mission_type"] == "reconnaissance"
     assert {by_unit["RescueCar-1"]["target_zone"], by_unit["RescueCar-2"]["target_zone"]} == {"A", "B"}
     assert all(item["target_zone"] != "C" for item in assignments if item["mission_type"] == "rescue")
+
+
+def test_drone_can_fly_directly_without_predefined_air_route():
+    scenario = allocation_scenario()
+    scenario["air_routes"] = []
+    scenario["units"] = [
+        {
+            "unit_id": "Drone-1",
+            "type": "drone",
+            "start_node": "HQ",
+            "speed": 2.0,
+            "can_transport": False,
+            "constraints": {},
+        }
+    ]
+    assessments = assess_zones(scenario)
+
+    matrix = build_utility_matrix(scenario, assessments)
+
+    candidate = next(
+        item
+        for item in matrix
+        if item["unit_id"] == "Drone-1" and item["target_zone"] == "C"
+    )
+    assert candidate["feasible"]
+    assert candidate["reason"] == "direct_air_route"
+    assert candidate["route"]["route_layer"] == "air"
+    assert candidate["route"]["path"] == ["HQ", "ZONE_C"]
+    assert candidate["route"]["road_ids"] == []
 
 
 def test_allocator_exposes_ranked_enumeration_trace_when_requested():

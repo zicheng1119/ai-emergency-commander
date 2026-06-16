@@ -6,6 +6,7 @@ from typing import Any
 
 from emergency_commander.allocation import allocate_tasks, build_utility_matrix
 from emergency_commander.bayesian_network import DiscreteBayesianNetwork
+from emergency_commander.expert_cpts import build_expert_network
 from emergency_commander.inference import assess_zones
 from emergency_commander.input_adapter import normalize_scenario
 from emergency_commander.pipeline import _invalidate_affected_missions, _public_plan
@@ -140,11 +141,32 @@ class LiveSimulation:
 
     def _active_zones(self) -> set[str]:
         return {
-            state["current_task"]["target_zone"]
+            state["current_task"].get("target_zone")
+            or state["current_task"].get("origin_zone")
             for state in self.unit_states.values()
             if state.get("current_task")
-            and state["current_task"].get("target_zone") is not None
+            and (
+                state["current_task"].get("target_zone") is not None
+                or state["current_task"].get("origin_zone") is not None
+            )
         }
+
+    def _has_idle_planning_work(self) -> bool:
+        if not any(state["status"] == "idle" for state in self.unit_states.values()):
+            return False
+        completed = self.completed_zones()
+        active = self._active_zones()
+        for assessment in self.assessments:
+            zone_id = assessment["zone_id"]
+            if zone_id in completed or zone_id in active:
+                continue
+            for state in self.unit_states.values():
+                if (
+                    state["status"] == "idle"
+                    and zone_id not in state.get("completed_targets", [])
+                ):
+                    return True
+        return False
 
     def _planning_scenario(self) -> dict[str, Any]:
         planning = deepcopy(self.scenario)
@@ -155,6 +177,10 @@ class LiveSimulation:
                 continue
             available = deepcopy(unit)
             available["start_node"] = state["current_node"]
+            if state.get("_temporary_route_edges"):
+                available["_temporary_route_edges"] = deepcopy(
+                    state["_temporary_route_edges"]
+                )
             planning["units"].append(available)
         return planning
 
@@ -173,6 +199,93 @@ class LiveSimulation:
             if candidate["target_zone"]
             not in self.unit_states[candidate["unit_id"]].get("completed_targets", [])
         ]
+
+    def _assign_idle_units_without_phase_loop(self) -> list[dict[str, Any]]:
+        planning = self._planning_scenario()
+        eligible = self._eligible_assessments()
+        if not planning["units"] or not eligible:
+            return []
+        matrix = self._filtered_matrix(
+            build_utility_matrix(planning, eligible, include_trace=True)
+        )
+        assignments = allocate_tasks(planning, matrix) if matrix else []
+        self._add_estimated_people(assignments)
+        start_assignments(self.unit_states, assignments, self.scenario)
+        if assignments:
+            self.utility_matrix = matrix
+        return assignments
+
+    def _build_drone_intel_event(self, unit_id: str, zone_id: str) -> dict[str, Any]:
+        zone = next(item for item in self.scenario["zones"] if item["zone_id"] == zone_id)
+        obs = zone["observations"]
+        return {
+            "event_id": f"AUTO_{len(self.event_log) + 1:03d}_DRONE_UPDATE",
+            "event_type": "drone_update",
+            "source": "automatic_drone_recon",
+            "trigger_step": self.step_count,
+            "elapsed_minutes": 0.0,
+            "target_id": zone_id,
+            "unit_id": unit_id,
+            "changes": {
+                "observations.drone_confidence": 1.0,
+                "observations.road_damage": max(0.0, round(obs["road_damage"] - 0.20, 3)),
+                "observations.congestion": max(0.0, round(obs["congestion"] - 0.12, 3)),
+            },
+            "description": f"{unit_id} 完成 {zone_id} 区侦察并自动回传道路情报",
+        }
+
+    def _apply_automatic_drone_intel(
+        self, before_states: dict[str, dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        for unit_id, state in self.unit_states.items():
+            if state["type"] != "drone":
+                continue
+            before_completed = set(before_states.get(unit_id, {}).get("completed_targets", []))
+            new_targets = [
+                zone_id
+                for zone_id in state.get("completed_targets", [])
+                if zone_id not in before_completed
+            ]
+            for zone_id in new_targets:
+                zone = next(
+                    item for item in self.scenario["zones"] if item["zone_id"] == zone_id
+                )
+                if zone["observations"].get("drone_confidence", 0.0) >= 1.0:
+                    continue
+                old_plan = deepcopy(self.current_plan)
+                event = self._build_drone_intel_event(unit_id, zone_id)
+                self.scenario = normalize_scenario(apply_event(self.scenario, event))
+                _invalidate_affected_missions(self.unit_states, event, self.scenario)
+                self.utility_matrix = []
+                self.current_plan = _public_plan(
+                    self.assessments, self.unit_states, self.utility_matrix
+                )
+                self.event_log.append(deepcopy(event))
+                self.replan_context = {
+                    "trigger_event": deepcopy(event),
+                    "clock_minutes": round(self.clock_minutes, 6),
+                    "old_plan": old_plan,
+                }
+                self.phase = "replan"
+                self._log(
+                    "replan",
+                    "无人机自动情报",
+                    f"{event['description']}，准备更新推理与任务分配",
+                )
+                self._record_calculation(
+                    "replan",
+                    "无人机情报自动回传",
+                    event["description"],
+                    focus={"zones": [zone_id], "units": [unit_id]},
+                    inputs={"event": event, "old_plan": old_plan},
+                    operations={
+                        "source": "automatic_drone_recon",
+                        "changes": event["changes"],
+                    },
+                    outputs={"next_phase": "replan"},
+                )
+                return event
+        return None
 
     def _log(self, phase: str, title: str, summary: str) -> None:
         self.algorithm_log.append(
@@ -373,7 +486,11 @@ class LiveSimulation:
             raise ValueError(f"event '{event['event_id']}' was already applied")
         old_plan = deepcopy(self.current_plan)
         self.scenario = normalize_scenario(apply_event(self.scenario, event))
-        _invalidate_affected_missions(self.unit_states, event)
+        _invalidate_affected_missions(self.unit_states, event, self.scenario)
+        self.utility_matrix = []
+        self.current_plan = _public_plan(
+            self.assessments, self.unit_states, self.utility_matrix
+        )
         self.event_log.append(deepcopy(event))
         self.replan_context = {
             "trigger_event": deepcopy(event),
@@ -464,10 +581,43 @@ class LiveSimulation:
                 self.assessments = assess_zones(
                     self.scenario, network, model_name=self.model_name
                 )
+                expert_assessments = assess_zones(
+                    self.scenario,
+                    build_expert_network(),
+                    model_name="expert_cpt",
+                )
+                expert_by_zone = {
+                    item["zone_id"]: item for item in expert_assessments
+                }
                 summary = f"完成 {len(self.assessments)} 个区域的后验概率计算"
                 self._log("infer", "贝叶斯推理", summary)
                 zone_records = []
+                comparison_rows = []
                 for item in self.assessments:
+                    expert = expert_by_zone[item["zone_id"]]
+                    comparison_rows.append(
+                        {
+                            "zone_id": item["zone_id"],
+                            "expert_trapped_prob": expert["trapped_prob"],
+                            "active_trapped_prob": item["trapped_prob"],
+                            "trapped_delta": round(
+                                item["trapped_prob"] - expert["trapped_prob"], 6
+                            ),
+                            "expert_passability_prob": expert["passability_prob"],
+                            "active_passability_prob": item["passability_prob"],
+                            "passability_delta": round(
+                                item["passability_prob"]
+                                - expert["passability_prob"],
+                                6,
+                            ),
+                            "expert_priority_score": expert["priority_score"],
+                            "active_priority_score": item["priority_score"],
+                            "priority_delta": round(
+                                item["priority_score"] - expert["priority_score"],
+                                6,
+                            ),
+                        }
+                    )
                     zone_records.append(
                         {
                             "zone_id": item["zone_id"],
@@ -500,6 +650,37 @@ class LiveSimulation:
                     },
                     outputs={"zones": zone_records},
                 )
+                self.calculation_history[-1]["outputs"][
+                    "model_comparison"
+                ] = {
+                    "baseline_model": "expert_cpt",
+                    "active_model": self.model_name,
+                    "shared_downstream_weights": [
+                        "life_risk",
+                        "priority",
+                        "utility",
+                        "astar_risk",
+                    ],
+                    "zones": comparison_rows,
+                    "max_abs_priority_delta": round(
+                        max(
+                            abs(row["priority_delta"])
+                            for row in comparison_rows
+                        )
+                        if comparison_rows
+                        else 0.0,
+                        6,
+                    ),
+                    "max_abs_trapped_delta": round(
+                        max(
+                            abs(row["trapped_delta"])
+                            for row in comparison_rows
+                        )
+                        if comparison_rows
+                        else 0.0,
+                        6,
+                    ),
+                }
                 self.phase = "prioritize"
             elif current_phase == "prioritize":
                 self.assessments.sort(
@@ -760,6 +941,9 @@ class LiveSimulation:
                 before_states = deepcopy(self.unit_states)
                 advance_unit_states(self.unit_states, elapsed, self.scenario)
                 self.clock_minutes = round(self.clock_minutes + elapsed, 6)
+                automatic_event = self._apply_automatic_drone_intel(before_states)
+                if automatic_event is None and self._has_idle_planning_work():
+                    self._assign_idle_units_without_phase_loop()
                 self.current_plan = _public_plan(
                     self.assessments, self.unit_states, self.utility_matrix
                 )
@@ -794,7 +978,9 @@ class LiveSimulation:
                     },
                 )
                 self._snapshot()
-                if len(self.completed_zones()) == len(self.scenario["zones"]):
+                if automatic_event is not None:
+                    self._snapshot(event=automatic_event)
+                elif len(self.completed_zones()) == len(self.scenario["zones"]):
                     self._mark_complete("all_rescues_complete")
                 elif self.clock_minutes >= self.max_minutes:
                     self._mark_complete("timeout")

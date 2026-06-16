@@ -68,7 +68,7 @@ def test_coordinate_astar_exposes_expansion_trace_when_requested():
     assert result["search_trace"][0]["relaxations"][0]["neighbor"] == "A"
 
 
-def test_drone_utility_uses_air_routes_and_never_ground_roads():
+def test_drone_utility_flies_directly_and_never_uses_ground_roads():
     scenario = allocation_scenario()
     scenario["nodes"] = {
         "HQ": {"x": 0.0, "y": 0.0},
@@ -92,11 +92,13 @@ def test_drone_utility_uses_air_routes_and_never_ground_roads():
     )
 
     assert drone_c["route"]["route_layer"] == "air"
-    assert drone_c["route"]["road_ids"] == ["air-hq-relay", "air-relay-c"]
+    assert drone_c["reason"] == "direct_air_route"
+    assert drone_c["route"]["path"] == ["HQ", "ZONE_C"]
+    assert drone_c["route"]["road_ids"] == []
     assert all(not route_id.startswith("to_") for route_id in drone_c["route"]["road_ids"])
 
 
-def test_drone_is_infeasible_when_air_graph_cannot_reach_zone():
+def test_drone_remains_feasible_without_air_graph():
     scenario = allocation_scenario()
     scenario["nodes"] = {
         "HQ": {"x": 0.0, "y": 0.0},
@@ -110,4 +112,8 @@ def test_drone_is_infeasible_when_air_graph_cannot_reach_zone():
     drone_candidates = [item for item in matrix if item["unit_id"] == "Drone-1"]
 
     assert drone_candidates
-    assert all(not item["feasible"] and item["reason"] == "no_air_route" for item in drone_candidates)
+    assert all(
+        item["feasible"] and item["reason"] == "direct_air_route"
+        for item in drone_candidates
+    )
+    assert all(item["route"]["road_ids"] == [] for item in drone_candidates)

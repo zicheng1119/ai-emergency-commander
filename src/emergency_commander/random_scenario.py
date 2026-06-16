@@ -195,7 +195,12 @@ def _generate_ground_roads(
                 )
             )
 
-    omitted_verticals = {(0, 1), (1, 4)}
+    omitted_verticals: set[tuple[int, int]] = set()
+    for row in range(GRID_ROWS - 1):
+        omitted_verticals.update(
+            (row, column)
+            for column in rng.sample(range(1, GRID_COLUMNS - 1), k=2)
+        )
     for row in range(GRID_ROWS - 1):
         for column in range(GRID_COLUMNS):
             if (row, column) in omitted_verticals:
@@ -211,6 +216,28 @@ def _generate_ground_roads(
                     risk_profile=profile,
                 )
             )
+
+    diagonal_candidates = [
+        ("J00", "J11"),
+        ("J01", "J10"),
+        ("J04", "J15"),
+        ("J05", "J14"),
+        ("J10", "J21"),
+        ("J11", "J20"),
+        ("J14", "J25"),
+        ("J15", "J24"),
+    ]
+    for start, end in rng.sample(diagonal_candidates, k=2):
+        roads.append(
+            _road(
+                f"R_{start}_{end}_BYPASS",
+                start,
+                end,
+                nodes,
+                rng,
+                risk_profile="safe",
+            )
+        )
 
     zone_connections = {
         "A": ("J00", "J01"),
@@ -244,6 +271,17 @@ def _generate_air_routes(
             _road(
                 f"AIR_RELAY_{zone_id}",
                 "AIR_RELAY",
+                f"ZONE_{zone_id}",
+                nodes,
+                rng,
+                air=True,
+            )
+        )
+    for zone_id in rng.sample(ZONE_IDS, k=2):
+        routes.append(
+            _road(
+                f"AIR_HQ_ZONE_{zone_id}_DIRECT",
+                "HQ",
                 f"ZONE_{zone_id}",
                 nodes,
                 rng,

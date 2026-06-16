@@ -1,9 +1,169 @@
 from copy import deepcopy
+import json
+from pathlib import Path
 
 import pytest
 
+from emergency_commander.bayesian_network import DiscreteBayesianNetwork
 from emergency_commander.live_simulation import LiveSimulation
 from emergency_commander.random_scenario import generate_random_scenario
+from tests.test_pipeline_replanning import scenario_with_higher_utility_sos
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _base_weights():
+    return {
+        "trapped": {"sos": 0.35, "collapse": 0.30, "human_activity": 0.20, "smoke": 0.15},
+        "passability": {"road_damage": 0.45, "fire_risk": 0.35, "congestion": 0.20, "drone_confidence": 0.0},
+        "life_risk": {"fire": 0.40, "trapped_prob": 0.35, "time_urgency": 0.25},
+        "priority": {"trapped_prob": 0.40, "life_risk": 0.30, "time_urgency": 0.20, "accessibility": 0.10},
+        "utility": {"alpha": 0.30, "beta": 0.25, "gamma": 0.20, "delta": 0.15, "epsilon": 0.10},
+        "astar_risk": {"fire": 0.35, "damage": 0.25, "congestion": 0.20, "secondary": 0.20},
+    }
+
+
+def _staggered_return_scenario():
+    def zone(zone_id, node_id, sos, urgency):
+        return {
+            "zone_id": zone_id,
+            "node_id": node_id,
+            "observations": {
+                "sos_signal": sos,
+                "building_collapse": 0.75,
+                "smoke": 0.20,
+                "fire": 0.20,
+                "road_damage": 0.10,
+                "human_activity": sos,
+                "congestion": 0.10,
+                "time_urgency": urgency,
+                "drone_confidence": 0.0,
+            },
+        }
+
+    def road(road_id, start, end, travel_time):
+        return {
+            "road_id": road_id,
+            "from": start,
+            "to": end,
+            "distance": travel_time,
+            "travel_time_base": travel_time,
+            "status": "open",
+            "risk": {"fire": 0.0, "damage": 0.0, "congestion": 0.0, "secondary_disaster": 0.0},
+        }
+
+    return {
+        "scenario_id": "staggered_return_case",
+        "generated_at": "2026-06-16T12:00:00+08:00",
+        "mode": "fixed",
+        "command_center": {"node_id": "HQ"},
+        "hospital": {"node_id": "HQ"},
+        "nodes": {
+            "HQ": {"x": 0.0, "y": 0.0},
+            "ZONE_A": {"x": 12.0, "y": 0.0},
+            "ZONE_B": {"x": 1.0, "y": 0.0},
+            "ZONE_C": {"x": 2.0, "y": 1.0},
+        },
+        "config": {
+            "weights": _base_weights(),
+            "thresholds": {"car_min_passability": 0.45, "drone_recon_priority_risk": 0.70},
+        },
+        "zones": [
+            zone("A", "ZONE_A", 0.95, 0.95),
+            zone("B", "ZONE_B", 0.90, 0.90),
+            zone("C", "ZONE_C", 0.85, 0.85),
+        ],
+        "roads": [
+            road("to_a", "HQ", "ZONE_A", 12.0),
+            road("to_b", "HQ", "ZONE_B", 1.0),
+            road("to_c", "HQ", "ZONE_C", 2.2),
+        ],
+        "air_routes": [],
+        "units": [
+            {
+                "unit_id": "RescueCar-1",
+                "type": "rescue_car",
+                "start_node": "HQ",
+                "speed": 4.0,
+                "can_transport": True,
+                "capacity": 4,
+                "service_time": 0.0,
+                "constraints": {"max_fire_risk": 0.70, "min_passability": 0.45},
+            },
+            {
+                "unit_id": "RescueCar-2",
+                "type": "rescue_car",
+                "start_node": "HQ",
+                "speed": 0.5,
+                "can_transport": True,
+                "capacity": 4,
+                "service_time": 0.0,
+                "constraints": {"max_fire_risk": 0.70, "min_passability": 0.45},
+            },
+        ],
+        "events": [],
+    }
+
+
+def _drone_recon_scenario():
+    return {
+        "scenario_id": "drone_recon_case",
+        "generated_at": "2026-06-16T13:00:00+08:00",
+        "mode": "fixed",
+        "command_center": {"node_id": "HQ"},
+        "hospital": {"node_id": "HQ"},
+        "nodes": {
+            "HQ": {"x": 0.0, "y": 0.0},
+            "ZONE_A": {"x": 3.0, "y": 0.0},
+        },
+        "config": {
+            "weights": _base_weights(),
+            "thresholds": {"car_min_passability": 0.45, "drone_recon_priority_risk": 0.70},
+        },
+        "zones": [
+            {
+                "zone_id": "A",
+                "node_id": "ZONE_A",
+                "observations": {
+                    "sos_signal": 0.70,
+                    "building_collapse": 0.70,
+                    "smoke": 0.70,
+                    "fire": 0.85,
+                    "road_damage": 0.90,
+                    "human_activity": 0.70,
+                    "congestion": 0.75,
+                    "time_urgency": 0.85,
+                    "drone_confidence": 0.0,
+                },
+            }
+        ],
+        "roads": [],
+        "air_routes": [
+            {
+                "road_id": "air_a",
+                "from": "HQ",
+                "to": "ZONE_A",
+                "distance": 3.0,
+                "travel_time_base": 3.0,
+                "status": "open",
+                "risk": {"fire": 0.0, "damage": 0.0, "congestion": 0.0, "secondary_disaster": 0.0},
+            }
+        ],
+        "units": [
+            {
+                "unit_id": "Drone-1",
+                "type": "drone",
+                "start_node": "HQ",
+                "speed": 3.0,
+                "can_transport": False,
+                "capacity": 0,
+                "service_time": 0.5,
+                "constraints": {},
+            }
+        ],
+        "events": [],
+    }
 
 
 def _advance_to_phase(session, phase, limit=30):
@@ -61,6 +221,30 @@ def test_live_session_starts_without_precomputing_and_advances_phases():
     )
     assert route_record["focus"]["roads"] == first_feasible["route"]["road_ids"]
     assert route_record["focus"]["zones"] == [first_feasible["target_zone"]]
+
+
+def test_learned_cpt_inference_record_exposes_difference_from_expert_cpt():
+    payload = json.loads(
+        (ROOT / "artifacts" / "full_bayesian_experiment" / "learned_network.json")
+        .read_text(encoding="utf-8")
+    )
+    learned_network = DiscreteBayesianNetwork.from_dict(payload)
+    session = LiveSimulation.create(
+        generate_random_scenario(20260616, mode="learned"),
+        seed=20260616,
+        model_name="learned_cpt",
+    )
+
+    session.step(network=learned_network)
+    session.step(network=learned_network)
+
+    record = session.calculation_history[-1]
+    comparison = record["outputs"]["model_comparison"]
+    assert record["inputs"]["model"] == "learned_cpt"
+    assert comparison["baseline_model"] == "expert_cpt"
+    assert comparison["active_model"] == "learned_cpt"
+    assert comparison["max_abs_priority_delta"] >= 0.01
+    assert any(abs(row["priority_delta"]) >= 0.01 for row in comparison["zones"])
 
 
 def test_execute_step_changes_clock_and_unit_position():
@@ -173,9 +357,143 @@ def test_road_collapse_invalidates_only_tasks_using_that_road():
     session.inject_event("road_collapse", target_id=target_road)
 
     assert session.unit_states[affected_unit]["current_task"] is None
+    assert all(
+        target_road not in route["road_ids"]
+        for route in session.current_plan["routes"]
+    )
     for unit_id, task in active_ground.items():
         if target_road not in task["route"]["road_ids"]:
             assert session.unit_states[unit_id]["current_task"] == task
+
+
+def test_road_collapse_replan_never_reuses_blocked_road():
+    session = LiveSimulation.create(generate_random_scenario(21), seed=21)
+    _advance_to_phase(session, "execute")
+    target_road = next(
+        road_id
+        for state in session.unit_states.values()
+        if state.get("current_task")
+        and state["current_task"]["route"].get("route_layer") == "ground"
+        for road_id in state["current_task"]["route"]["road_ids"]
+    )
+
+    session.inject_event("road_collapse", target_id=target_road)
+    while session.phase != "execute":
+        session.step()
+
+    assert next(
+        road for road in session.scenario["roads"] if road["road_id"] == target_road
+    )["status"] == "blocked"
+    assert all(
+        target_road not in route["road_ids"]
+        for route in session.current_plan["routes"]
+    )
+    assert all(
+        target_road not in (state.get("current_task") or {}).get("route", {}).get("road_ids", [])
+        for state in session.unit_states.values()
+    )
+
+
+def test_road_collapse_reroutes_returning_unit_away_from_blocked_road():
+    session = LiveSimulation.create(generate_random_scenario(1), seed=1)
+    _advance_to_phase(session, "execute")
+    returning_unit = None
+    for _ in range(80):
+        returning = [
+            state
+            for state in session.unit_states.values()
+            if state["status"] == "returning"
+            and state.get("current_task")
+            and state["current_task"]["route"].get("route_layer") == "ground"
+            and state["current_task"]["route"]["road_ids"]
+        ]
+        if returning:
+            returning_unit = returning[0]
+            break
+        session.step(to_next_transition=True)
+    assert returning_unit is not None
+    target_road = returning_unit["current_task"]["route"]["road_ids"][0]
+    unit_id = returning_unit["unit_id"]
+
+    session.inject_event("road_collapse", target_id=target_road)
+
+    rerouted = session.unit_states[unit_id]
+    assert rerouted["status"] == "returning"
+    assert target_road not in rerouted["current_task"]["route"]["road_ids"]
+    assert all(
+        target_road not in route["road_ids"]
+        for route in session.current_plan["routes"]
+    )
+
+
+def test_live_new_sos_replans_active_car_to_higher_utility_zone():
+    scenario = scenario_with_higher_utility_sos()
+    event = scenario["events"][0]
+    scenario["events"] = []
+    session = LiveSimulation.create(scenario, seed=20260616)
+    _advance_to_phase(session, "execute")
+    assert session.current_plan["assignments"][0]["target_zone"] == "A"
+
+    session.step(execution_minutes=1.0)
+    session.inject_event_payload(event)
+    while session.phase != "execute":
+        session.step()
+
+    assignment = session.current_plan["assignments"][0]
+    route = session.current_plan["routes"][0]
+    assert assignment["target_zone"] == "B"
+    assert route["path"][0].startswith("__unit_RescueCar-1_position")
+    assert session.unit_states["RescueCar-1"]["current_node"].startswith(
+        "__unit_RescueCar-1_position"
+    )
+
+
+def test_idle_unit_replans_without_waiting_for_all_other_units_to_return():
+    session = LiveSimulation.create(_staggered_return_scenario(), seed=20260616)
+    _advance_to_phase(session, "execute")
+
+    for _ in range(20):
+        session.step(to_next_transition=True)
+        redeployed = [
+            state
+            for state in session.unit_states.values()
+            if state["status"] == "en_route"
+            and state.get("delivered_targets")
+            and (state.get("current_task") or {}).get("target_zone") == "A"
+        ]
+        active = [
+            state
+            for state in session.unit_states.values()
+            if state["status"] in {"en_route", "rescuing", "returning"}
+        ]
+        if redeployed and len(active) >= 2 and len(session.completed_zones()) < len(session.scenario["zones"]):
+            assert session.phase == "execute"
+            assert not any(
+                record["phase"] in {"infer", "prioritize", "route", "utility", "allocate"}
+                and record["clock_minutes"] == session.clock_minutes
+                for record in session.calculation_history
+            )
+            return
+
+    pytest.fail("idle delivered unit was not redeployed while another unit was active")
+
+
+def test_drone_recon_automatically_transmits_intel_and_triggers_replan():
+    session = LiveSimulation.create(_drone_recon_scenario(), seed=20260616)
+    _advance_to_phase(session, "execute")
+    assert session.current_plan["assignments"][0]["mission_type"] == "reconnaissance"
+    assert session.scenario["zones"][0]["observations"]["drone_confidence"] == 0.0
+
+    session.step(to_next_transition=True)
+    session.step(to_next_transition=True)
+
+    observations = session.scenario["zones"][0]["observations"]
+    assert observations["drone_confidence"] == 1.0
+    assert observations["road_damage"] < 0.90
+    assert observations["congestion"] < 0.75
+    assert session.phase == "replan"
+    assert session.event_log[-1]["event_type"] == "drone_update"
+    assert session.event_log[-1]["source"] == "automatic_drone_recon"
 
 
 def test_paused_session_does_not_advance_and_can_resume():

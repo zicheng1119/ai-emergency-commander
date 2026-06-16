@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from itertools import product
+from math import hypot
 from typing import Any
 
 from emergency_commander.routing import NoRouteError, risk_aware_astar
@@ -13,6 +14,26 @@ def _zone_lookup(scenario: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def _resource_cost(unit: dict[str, Any]) -> float:
     default = 0.25 if unit["type"] == "drone" else 0.55
     return max(0.0, min(1.0, float(unit.get("resource_cost", default))))
+
+
+def _route_graph_for_unit(
+    route_graph: list[dict[str, Any]], unit_id: str
+) -> list[dict[str, Any]]:
+    return [
+        road
+        for road in route_graph
+        if road.get("labels", {}).get("unit_anchor") in {None, unit_id}
+    ]
+
+
+def _hide_temporary_route_edges(route: dict[str, Any]) -> dict[str, Any]:
+    road_ids = route.get("road_ids", [])
+    if any(road_id.startswith("__unit_") for road_id in road_ids):
+        route["_edge_road_ids"] = list(road_ids)
+        route["road_ids"] = [
+            road_id for road_id in road_ids if not road_id.startswith("__unit_")
+        ]
+    return route
 
 
 def _rejection_explanation(unit_id: str, zone_id: str, reason: str) -> str:
@@ -47,6 +68,135 @@ def _utility_explanation(
     )
 
 
+def _route_with_risk_fallback(
+    route_graph: list[dict[str, Any]],
+    *,
+    nodes: dict[str, dict[str, float]] | None,
+    start: str,
+    goal: str,
+    speed: float,
+    risk_weights: dict[str, float],
+    unit_type: str,
+    max_fire_risk: float | None,
+    route_layer: str,
+    include_trace: bool,
+) -> tuple[dict[str, Any], str]:
+    try:
+        route = risk_aware_astar(
+            route_graph,
+            nodes=nodes,
+            start=start,
+            goal=goal,
+            speed=speed,
+            risk_weights=risk_weights,
+            unit_type=unit_type,
+            max_fire_risk=max_fire_risk,
+            route_layer=route_layer,
+            include_trace=include_trace,
+        )
+        route["risk_policy"] = "standard"
+        return route, "feasible"
+    except NoRouteError:
+        if (
+            unit_type == "drone"
+            or max_fire_risk is None
+            or not any(road.get("status") == "blocked" for road in route_graph)
+        ):
+            raise
+    route = risk_aware_astar(
+        route_graph,
+        nodes=nodes,
+        start=start,
+        goal=goal,
+        speed=speed,
+        risk_weights=risk_weights,
+        unit_type=unit_type,
+        max_fire_risk=None,
+        route_layer=route_layer,
+        include_trace=include_trace,
+    )
+    route["risk_policy"] = "relaxed_fire_limit"
+    route["relaxed_constraints"] = ["max_fire_risk"]
+    return route, "feasible_with_risk_override"
+
+
+def _direct_air_route(
+    nodes: dict[str, dict[str, float]] | None,
+    *,
+    start: str,
+    goal: str,
+    speed: float,
+    include_trace: bool,
+) -> dict[str, Any]:
+    if speed <= 0:
+        raise ValueError("speed must be positive")
+    if start == goal:
+        result = {
+            "path": [start],
+            "road_ids": [],
+            "eta": 0.0,
+            "path_risk": 0.0,
+            "total_cost": 0.0,
+            "route_layer": "air",
+            "heuristic": "direct_air",
+            "heuristic_start": 0.0,
+            "expanded_nodes": 0,
+        }
+        if include_trace:
+            result["search_trace"] = []
+        return result
+    if not nodes or start not in nodes or goal not in nodes:
+        raise NoRouteError(
+            f"missing coordinates for direct air route from {start} to {goal}"
+        )
+
+    distance = hypot(
+        float(nodes[start]["x"]) - float(nodes[goal]["x"]),
+        float(nodes[start]["y"]) - float(nodes[goal]["y"]),
+    )
+    eta = distance / speed
+    result = {
+        "path": [start, goal],
+        "road_ids": [],
+        "eta": round(eta, 6),
+        "path_risk": 0.0,
+        "total_cost": round(eta, 6),
+        "route_layer": "air",
+        "heuristic": "direct_air",
+        "heuristic_start": round(eta, 6),
+        "expanded_nodes": 1,
+    }
+    if include_trace:
+        result["search_trace"] = [
+            {
+                "node": start,
+                "g": 0.0,
+                "h": round(eta, 6),
+                "f": round(eta, 6),
+                "frontier_size": 1,
+                "relaxations": [
+                    {
+                        "neighbor": goal,
+                        "road_id": "direct_air",
+                        "g": round(eta, 6),
+                        "h": 0.0,
+                        "f": round(eta, 6),
+                        "edge_cost": round(eta, 6),
+                    }
+                ],
+            },
+            {
+                "node": goal,
+                "g": round(eta, 6),
+                "h": 0.0,
+                "f": round(eta, 6),
+                "frontier_size": 0,
+                "relaxations": [],
+            },
+        ]
+    return result
+
+
 def build_utility_matrix(
     scenario: dict[str, Any],
     assessments: list[dict[str, Any]],
@@ -76,21 +226,37 @@ def build_utility_matrix(
 
             route = None
             if feasible:
-                route_layer = "air" if is_drone else "ground"
-                route_graph = scenario.get("air_routes", []) if is_drone else scenario["roads"]
                 try:
-                    route = risk_aware_astar(
-                        route_graph,
-                        nodes=scenario.get("nodes"),
-                        start=unit["start_node"],
-                        goal=assessment["node_id"],
-                        speed=float(unit["speed"]),
-                        risk_weights=risk_weights,
-                        unit_type=unit["type"],
-                        max_fire_risk=constraints.get("max_fire_risk") if not is_drone else None,
-                        route_layer=route_layer,
-                        include_trace=include_trace,
-                    )
+                    if is_drone:
+                        route = _direct_air_route(
+                            scenario.get("nodes"),
+                            start=unit["start_node"],
+                            goal=assessment["node_id"],
+                            speed=float(unit["speed"]),
+                            include_trace=include_trace,
+                        )
+                        reason = "direct_air_route"
+                    else:
+                        route_graph = _route_graph_for_unit(
+                            [
+                                *scenario["roads"],
+                                *unit.get("_temporary_route_edges", []),
+                            ],
+                            unit["unit_id"],
+                        )
+                        route, reason = _route_with_risk_fallback(
+                            route_graph,
+                            nodes=scenario.get("nodes"),
+                            start=unit["start_node"],
+                            goal=assessment["node_id"],
+                            speed=float(unit["speed"]),
+                            risk_weights=risk_weights,
+                            unit_type=unit["type"],
+                            max_fire_risk=constraints.get("max_fire_risk"),
+                            route_layer="ground",
+                            include_trace=include_trace,
+                        )
+                        _hide_temporary_route_edges(route)
                 except NoRouteError:
                     feasible = False
                     reason = "no_air_route" if is_drone else "no_ground_route"

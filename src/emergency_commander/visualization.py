@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import pandas as pd
@@ -15,6 +16,195 @@ UNIT_COLORS = {
     "Drone-1": "#20b8cd",
     "Drone-2": "#5b8ff9",
 }
+
+FIRE_STATUS_COLORS = {
+    "low": "#f4d35e",
+    "medium": "#ff9f1c",
+    "high": "#e3342f",
+}
+SANDBOX_GRID_CELL_SIZE = 0.45
+SANDBOX_STATE_COLORS = {
+    0: "#e7d3a8",
+    1: "#d8c28f",
+    2: "#ffb13b",
+    3: "#e3342f",
+    4: "#111111",
+    5: "#5b1515",
+}
+SANDBOX_STATE_LABELS = {
+    0: "stable terrain",
+    1: "smoke or light hazard",
+    2: "damaged / congested area",
+    3: "active fire",
+    4: "open road",
+    5: "blocked road",
+}
+
+
+def _is_synthetic_connector(edge: dict[str, Any]) -> bool:
+    return bool(edge.get("labels", {}).get("unit_anchor"))
+
+
+def _sandbox_bounds(nodes: dict[str, dict[str, float]]) -> tuple[float, float, float, float]:
+    x_values = [node["x"] for node in nodes.values()]
+    y_values = [node["y"] for node in nodes.values()]
+    return (
+        min(x_values) - 2.5,
+        max(x_values) + 2.5,
+        min(y_values) - 2.5,
+        max(y_values) + 2.5,
+    )
+
+
+def _discrete_colorscale(colors: dict[int, str]) -> list[list[float | str]]:
+    max_value = max(colors)
+    scale: list[list[float | str]] = []
+    for value, color in sorted(colors.items()):
+        start = max(0.0, (value - 0.5) / max_value)
+        end = min(1.0, (value + 0.5) / max_value)
+        scale.append([start, color])
+        scale.append([end, color])
+    return scale
+
+
+def _distance_to_segment(
+    point_x: float,
+    point_y: float,
+    start: dict[str, float],
+    end: dict[str, float],
+) -> float:
+    segment_x = end["x"] - start["x"]
+    segment_y = end["y"] - start["y"]
+    segment_length_squared = segment_x * segment_x + segment_y * segment_y
+    if segment_length_squared == 0:
+        return math.hypot(point_x - start["x"], point_y - start["y"])
+    projection = (
+        ((point_x - start["x"]) * segment_x + (point_y - start["y"]) * segment_y)
+        / segment_length_squared
+    )
+    projection = max(0.0, min(1.0, projection))
+    nearest_x = start["x"] + projection * segment_x
+    nearest_y = start["y"] + projection * segment_y
+    return math.hypot(point_x - nearest_x, point_y - nearest_y)
+
+
+def _zone_state_for_cell(
+    point_x: float,
+    point_y: float,
+    scenario: dict[str, Any],
+) -> int:
+    nodes = scenario["nodes"]
+    state = 0
+    for zone in scenario["zones"]:
+        node = nodes[zone["node_id"]]
+        distance = math.hypot(point_x - node["x"], point_y - node["y"])
+        if distance > 3.4:
+            continue
+        observations = zone["observations"]
+        if observations["fire"] >= 0.50 and distance <= 2.6:
+            state = max(state, 3)
+        elif (
+            observations["road_damage"] >= 0.38
+            or observations["congestion"] >= 0.55
+            or observations["smoke"] >= 0.55
+            or (observations["fire"] >= 0.35 and distance <= 3.0)
+        ):
+            state = max(state, 2)
+        else:
+            state = max(state, 1)
+    return state
+
+
+def _road_state_for_cell(
+    point_x: float,
+    point_y: float,
+    scenario: dict[str, Any],
+) -> int | None:
+    nodes = scenario["nodes"]
+    road_half_width = SANDBOX_GRID_CELL_SIZE * 0.72
+    for road in scenario["roads"]:
+        if _is_synthetic_connector(road):
+            continue
+        if road["from"] not in nodes or road["to"] not in nodes:
+            continue
+        distance = _distance_to_segment(
+            point_x,
+            point_y,
+            nodes[road["from"]],
+            nodes[road["to"]],
+        )
+        if distance <= road_half_width:
+            return 5 if road.get("status") == "blocked" else 4
+    return None
+
+
+def _add_sandbox_state_grid(figure: go.Figure, scenario: dict[str, Any]) -> None:
+    nodes = scenario["nodes"]
+    min_x, max_x, min_y, max_y = _sandbox_bounds(nodes)
+    x_values = [
+        round(min_x + SANDBOX_GRID_CELL_SIZE / 2 + index * SANDBOX_GRID_CELL_SIZE, 3)
+        for index in range(math.ceil((max_x - min_x) / SANDBOX_GRID_CELL_SIZE))
+    ]
+    y_values = [
+        round(min_y + SANDBOX_GRID_CELL_SIZE / 2 + index * SANDBOX_GRID_CELL_SIZE, 3)
+        for index in range(math.ceil((max_y - min_y) / SANDBOX_GRID_CELL_SIZE))
+    ]
+    z_values: list[list[int]] = []
+    hover_text: list[list[str]] = []
+    for y in y_values:
+        z_row: list[int] = []
+        hover_row: list[str] = []
+        for x in x_values:
+            state = _zone_state_for_cell(x, y, scenario)
+            road_state = _road_state_for_cell(x, y, scenario)
+            if road_state is not None:
+                state = road_state
+            z_row.append(state)
+            hover_row.append(
+                f"x {x:.2f} / y {y:.2f}<br>{SANDBOX_STATE_LABELS[state]}"
+            )
+        z_values.append(z_row)
+        hover_text.append(hover_row)
+    figure.add_trace(
+        go.Heatmap(
+            x=x_values,
+            y=y_values,
+            z=z_values,
+            name="Sandbox state grid",
+            zmin=0,
+            zmax=max(SANDBOX_STATE_COLORS),
+            colorscale=_discrete_colorscale(SANDBOX_STATE_COLORS),
+            showscale=True,
+            text=hover_text,
+            hovertemplate="%{text}<extra></extra>",
+            colorbar={
+                "title": {"text": "Cell state", "font": {"color": "#f4ead5"}},
+                "tickmode": "array",
+                "tickvals": list(SANDBOX_STATE_LABELS),
+                "ticktext": [
+                    "clear",
+                    "smoke",
+                    "damage",
+                    "fire",
+                    "road",
+                    "block",
+                ],
+                "tickfont": {"color": "#f4ead5", "size": 9},
+                "thickness": 9,
+                "len": 0.74,
+                "y": 0.48,
+            },
+        )
+    )
+
+
+def _fire_status(observations: dict[str, float]) -> str:
+    fire = observations["fire"]
+    if fire >= 0.50:
+        return "high"
+    if fire >= 0.30:
+        return "medium"
+    return "low"
 
 
 def _edge_trace(
@@ -58,6 +248,8 @@ def _ground_risk_groups(scenario: dict[str, Any]) -> list[tuple[str, str, list[d
         "Blocked": [],
     }
     for road in scenario["roads"]:
+        if _is_synthetic_connector(road):
+            continue
         decorated = dict(road)
         decorated["display_risk"] = road_risk(road, weights)
         if road.get("status", "open") == "blocked":
@@ -69,10 +261,10 @@ def _ground_risk_groups(scenario: dict[str, Any]) -> list[tuple[str, str, list[d
         else:
             groups["High risk"].append(decorated)
     return [
-        ("Low risk", "#32845f", groups["Low risk"]),
-        ("Medium risk", "#d89b24", groups["Medium risk"]),
-        ("High risk", "#d4422b", groups["High risk"]),
-        ("Blocked", "#2d2a26", groups["Blocked"]),
+        ("Low risk", "#12633f", groups["Low risk"]),
+        ("Medium risk", "#b97808", groups["Medium risk"]),
+        ("High risk", "#b52f23", groups["High risk"]),
+        ("Blocked", "#1b1712", groups["Blocked"]),
     ]
 
 
@@ -91,6 +283,23 @@ def build_map_figure(
     }
     focus = focus or {}
     figure = go.Figure()
+    _add_sandbox_state_grid(figure, scenario)
+    open_roads = [
+        road
+        for road in scenario["roads"]
+        if road.get("status", "open") == "open"
+        and not _is_synthetic_connector(road)
+    ]
+    if open_roads:
+        figure.add_trace(
+            _edge_trace(
+                open_roads,
+                nodes,
+                name="State · Roads",
+                color="#111111",
+            )
+        )
+        figure.data[-1].line.width = 3
     for label, color, roads in _ground_risk_groups(scenario):
         if not roads:
             continue
@@ -105,15 +314,24 @@ def build_map_figure(
         )
     figure.add_trace(
         _edge_trace(
-            scenario.get("air_routes", []),
+            [
+                route
+                for route in scenario.get("air_routes", [])
+                if not _is_synthetic_connector(route)
+            ],
             nodes,
             name="Air corridors",
-            color="#20b8cd",
+            color="#008bb0",
             dash="dot",
         )
     )
 
-    blocked = [road for road in scenario["roads"] if road.get("status") == "blocked"]
+    blocked = [
+        road
+        for road in scenario["roads"]
+        if road.get("status") == "blocked"
+        and not _is_synthetic_connector(road)
+    ]
     if blocked:
         figure.add_trace(
             go.Scatter(
@@ -165,7 +383,7 @@ def build_map_figure(
                 name="Candidate routes",
                 text=candidate_hover,
                 hoverinfo="text",
-                line={"color": "rgba(255,255,255,.42)", "width": 2},
+                line={"color": "rgba(42,55,65,.45)", "width": 3},
             )
         )
 
@@ -244,6 +462,40 @@ def build_map_figure(
             x=[nodes[zone["node_id"]]["x"] for zone in zones],
             y=[nodes[zone["node_id"]]["y"] for zone in zones],
             mode="markers",
+            name="State · Fire zones",
+            text=[
+                f"{zone['zone_id']} fire {zone['observations']['fire']:.2f}"
+                for zone in zones
+            ],
+            marker={
+                "size": [18 + 18 * zone["observations"]["fire"] for zone in zones],
+                "symbol": "square",
+                "color": [
+                    FIRE_STATUS_COLORS[_fire_status(zone["observations"])]
+                    for zone in zones
+                ],
+                "opacity": 0.82,
+                "line": {"color": "#111111", "width": 1},
+            },
+            customdata=[
+                [
+                    zone["observations"]["fire"],
+                    zone["observations"]["smoke"],
+                    _fire_status(zone["observations"]),
+                ]
+                for zone in zones
+            ],
+            hovertemplate=(
+                "ZONE %{text}<br>Fire %{customdata[0]:.2f}"
+                "<br>Smoke %{customdata[1]:.2f}<br>Status %{customdata[2]}<extra></extra>"
+            ),
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=[nodes[zone["node_id"]]["x"] for zone in zones],
+            y=[nodes[zone["node_id"]]["y"] for zone in zones],
+            mode="markers",
             name="Risk halo",
             hoverinfo="skip",
             marker={
@@ -261,19 +513,15 @@ def build_map_figure(
             name="Disaster zones",
             text=[f"#{rank_by_zone[zone['zone_id']]}  ZONE {zone['zone_id']}" for zone in zones],
             textposition="top center",
-            textfont={"color": "#f8edd6", "size": 11},
+            textfont={"color": "#1b1712", "size": 12},
             marker={
                 "size": [21 + 16 * display_assessments[zone["zone_id"]]["life_risk"] for zone in zones],
                 "color": [display_assessments[zone["zone_id"]]["life_risk"] for zone in zones],
                 "colorscale": [[0, "#f5d58d"], [0.55, "#f2943d"], [1, "#dc3b2a"]],
                 "cmin": 0,
                 "cmax": 1,
-                "line": {"color": "#2d2a26", "width": 2},
-                "colorbar": {
-                    "title": {"text": "Life risk", "font": {"color": "#d9e0e2"}},
-                    "tickfont": {"color": "#aeb9bd"},
-                    "thickness": 10,
-                },
+                "showscale": False,
+                "line": {"color": "#1b1712", "width": 2},
             },
             customdata=[
                 [
@@ -302,8 +550,8 @@ def build_map_figure(
                 text=junction_ids,
                 marker={
                     "size": 5,
-                    "color": "#827868",
-                    "line": {"color": "#f4ead5", "width": 1},
+                    "color": "#59462d",
+                    "line": {"color": "#fff3d0", "width": 1},
                 },
                 hovertemplate="Junction %{text}<extra></extra>",
             )
@@ -320,7 +568,7 @@ def build_map_figure(
             name="Infrastructure",
             text=infrastructure_ids,
             textposition="bottom center",
-            textfont={"color": "#f8edd6", "size": 10},
+            textfont={"color": "#1b1712", "size": 11},
             marker={"size": 15, "symbol": "diamond", "color": "#2d2a26"},
         )
     )
@@ -344,7 +592,7 @@ def build_map_figure(
             name="Units",
             text=list(states),
             textposition="middle right",
-            textfont={"color": "#f8edd6", "size": 10},
+            textfont={"color": "#1b1712", "size": 11},
             marker={
                 "size": 17,
                 "symbol": ["triangle-up" if state["type"] == "drone" else "square" for state in states.values()],
@@ -413,9 +661,9 @@ def build_map_figure(
     figure.update_layout(
         height=610,
         margin={"l": 4, "r": 4, "t": 30, "b": 4},
-        paper_bgcolor="#171b20",
-        plot_bgcolor="#262b30",
-        font={"family": "Avenir Next Condensed, sans-serif", "color": "#f3ead5"},
+        paper_bgcolor="#11161b",
+        plot_bgcolor="#e5d0a6",
+        font={"family": "Avenir Next Condensed, sans-serif", "color": "#1b1712"},
         legend={
             "orientation": "h",
             "y": 1.04,
@@ -451,6 +699,8 @@ def build_utility_frame(utility_matrix: list[dict[str, Any]]) -> pd.DataFrame:
         "feasible": "可执行",
         "passability_below_vehicle_minimum": "道路通行概率不足",
         "fire_risk_above_vehicle_maximum": "火灾风险超限",
+        "direct_air_route": "空中直飞",
+        "feasible_with_risk_override": "高风险绕行",
         "no_air_route": "无可达空中航线",
         "no_ground_route": "无可达地面路线",
     }

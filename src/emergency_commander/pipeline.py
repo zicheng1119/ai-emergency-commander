@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from math import hypot
 from typing import Any
 
 from emergency_commander.allocation import allocate_tasks, build_utility_matrix
@@ -9,11 +10,265 @@ from emergency_commander.contracts import validate_decision_output
 from emergency_commander.inference import assess_zones
 from emergency_commander.input_adapter import normalize_scenario
 from emergency_commander.replanning import apply_event
+from emergency_commander.routing import NoRouteError, risk_aware_astar
 from emergency_commander.simulation import (
     advance_unit_states,
     initialize_unit_states,
     start_assignments,
 )
+
+
+POSITION_ANCHOR_PREFIX = "__unit_"
+
+
+def _position_anchor_id(unit_id: str) -> str:
+    return f"{POSITION_ANCHOR_PREFIX}{unit_id}_position"
+
+
+def _strip_position_anchor(scenario: dict[str, Any], unit_id: str) -> None:
+    anchor_id = _position_anchor_id(unit_id)
+    scenario.get("nodes", {}).pop(anchor_id, None)
+    connector_prefix = f"{anchor_id}_connector_"
+    for collection in ("roads", "air_routes"):
+        scenario[collection] = [
+            road
+            for road in scenario.get(collection, [])
+            if not road["road_id"].startswith(connector_prefix)
+        ]
+
+
+def _same_position(
+    left: dict[str, float] | None, right: dict[str, float] | None
+) -> bool:
+    if not left or not right:
+        return False
+    return (
+        abs(float(left["x"]) - float(right["x"])) <= 1e-6
+        and abs(float(left["y"]) - float(right["y"])) <= 1e-6
+    )
+
+
+def _route_graph_for_unit(
+    route_graph: list[dict[str, Any]], unit_id: str
+) -> list[dict[str, Any]]:
+    return [
+        road
+        for road in route_graph
+        if road.get("labels", {}).get("unit_anchor") in {None, unit_id}
+    ]
+
+
+def _hide_temporary_route_edges(route: dict[str, Any]) -> dict[str, Any]:
+    road_ids = route.get("road_ids", [])
+    if any(road_id.startswith(POSITION_ANCHOR_PREFIX) for road_id in road_ids):
+        route["_edge_road_ids"] = list(road_ids)
+        route["road_ids"] = [
+            road_id
+            for road_id in road_ids
+            if not road_id.startswith(POSITION_ANCHOR_PREFIX)
+        ]
+    return route
+
+
+def _distance_to_segment(
+    point: dict[str, float],
+    start: dict[str, float],
+    end: dict[str, float],
+) -> float:
+    segment_x = float(end["x"]) - float(start["x"])
+    segment_y = float(end["y"]) - float(start["y"])
+    segment_length_squared = segment_x * segment_x + segment_y * segment_y
+    if segment_length_squared <= 1e-12:
+        return hypot(
+            float(point["x"]) - float(start["x"]),
+            float(point["y"]) - float(start["y"]),
+        )
+    projection = (
+        (float(point["x"]) - float(start["x"])) * segment_x
+        + (float(point["y"]) - float(start["y"])) * segment_y
+    ) / segment_length_squared
+    projection = max(0.0, min(1.0, projection))
+    nearest_x = float(start["x"]) + projection * segment_x
+    nearest_y = float(start["y"]) + projection * segment_y
+    return hypot(float(point["x"]) - nearest_x, float(point["y"]) - nearest_y)
+
+
+def _road_by_id(scenario: dict[str, Any], road_id: str | None) -> dict[str, Any] | None:
+    if road_id is None:
+        return None
+    for road in scenario.get("roads", []):
+        if road["road_id"] == road_id:
+            return road
+    return None
+
+
+def _current_route_segment(
+    scenario: dict[str, Any],
+    state: dict[str, Any],
+) -> tuple[str, str, dict[str, Any] | None] | None:
+    task = state.get("current_task") or {}
+    route = task.get("route") or {}
+    path = route.get("path") or []
+    if len(path) < 2 or not isinstance(state.get("position"), dict):
+        return None
+
+    nodes = scenario.get("nodes", {})
+    position = state["position"]
+    candidates = []
+    edge_road_ids = route.get("_edge_road_ids", route.get("road_ids", []))
+    for index, (start_id, end_id) in enumerate(zip(path, path[1:])):
+        if start_id not in nodes or end_id not in nodes:
+            continue
+        road_id = None
+        if index < len(edge_road_ids):
+            road_id = edge_road_ids[index]
+        candidates.append(
+            (
+                _distance_to_segment(position, nodes[start_id], nodes[end_id]),
+                index,
+                start_id,
+                end_id,
+                _road_by_id(scenario, road_id),
+            )
+        )
+    if not candidates:
+        return None
+    _, _, start_id, end_id, road = min(candidates, key=lambda item: (item[0], item[1]))
+    return start_id, end_id, road
+
+
+def _connector_travel_time(
+    *,
+    position: dict[str, float],
+    endpoint: dict[str, float],
+    segment_start: dict[str, float] | None,
+    segment_end: dict[str, float] | None,
+    base_road: dict[str, Any] | None,
+) -> float:
+    distance = hypot(
+        float(position["x"]) - endpoint["x"],
+        float(position["y"]) - endpoint["y"],
+    )
+    if not base_road or not segment_start or not segment_end:
+        return distance
+    segment_distance = hypot(
+        float(segment_start["x"]) - float(segment_end["x"]),
+        float(segment_start["y"]) - float(segment_end["y"]),
+    )
+    if segment_distance <= 1e-6:
+        return distance
+    return float(base_road["travel_time_base"]) * distance / segment_distance
+
+
+def _ensure_position_anchor(
+    scenario: dict[str, Any], state: dict[str, Any], unit: dict[str, Any]
+) -> str:
+    """Attach a temporary graph node at the unit's current visual position."""
+    nodes = scenario.get("nodes", {})
+    position = state.get("position")
+    if not nodes or not isinstance(position, dict):
+        state.pop("_temporary_route_edges", None)
+        return state["current_node"]
+    for node_id, coordinates in nodes.items():
+        if not node_id.startswith(POSITION_ANCHOR_PREFIX) and _same_position(
+            position, coordinates
+        ):
+            state["current_node"] = node_id
+            state.pop("_temporary_route_edges", None)
+            return node_id
+
+    unit_id = state["unit_id"]
+    anchor_id = _position_anchor_id(unit_id)
+    _strip_position_anchor(scenario, unit_id)
+    nodes[anchor_id] = {
+        "x": round(float(position["x"]), 6),
+        "y": round(float(position["y"]), 6),
+    }
+
+    if unit["type"] == "drone":
+        state["current_node"] = anchor_id
+        state.pop("_temporary_route_edges", None)
+        return anchor_id
+
+    segment = _current_route_segment(scenario, state)
+    base_road = None
+    segment_start_id = None
+    segment_end_id = None
+    if segment:
+        segment_start_id, segment_end_id, base_road = segment
+        if base_road and base_road.get("status", "open") == "blocked":
+            ranked_endpoint_ids = [segment_start_id]
+        else:
+            ranked_endpoint_ids = [segment_start_id, segment_end_id]
+    elif state.get("current_node") in nodes and not str(state["current_node"]).startswith(
+        POSITION_ANCHOR_PREFIX
+    ):
+        ranked_endpoint_ids = [state["current_node"]]
+    else:
+        ranked_endpoint_ids = []
+
+    temporary_edges = []
+    for node_id in ranked_endpoint_ids:
+        if node_id not in nodes:
+            continue
+        distance = hypot(
+            float(position["x"]) - nodes[node_id]["x"],
+            float(position["y"]) - nodes[node_id]["y"],
+        )
+        travel_time = _connector_travel_time(
+            position=position,
+            endpoint=nodes[node_id],
+            segment_start=nodes.get(segment_start_id) if segment_start_id else None,
+            segment_end=nodes.get(segment_end_id) if segment_end_id else None,
+            base_road=base_road,
+        )
+        if distance <= 1e-6:
+            continue
+        labels = {"synthetic": True, "unit_anchor": unit_id}
+        if base_road:
+            labels["base_road_id"] = base_road["road_id"]
+        temporary_edges.append(
+            {
+                "road_id": f"{anchor_id}_connector_{node_id}",
+                "from": anchor_id,
+                "to": node_id,
+                "distance": round(distance, 6),
+                "travel_time_base": round(travel_time, 6),
+                "status": "open",
+                "bidirectional": True,
+                "risk": deepcopy(base_road["risk"])
+                if base_road
+                else {
+                    "fire": 0.0,
+                    "damage": 0.0,
+                    "congestion": 0.0,
+                    "secondary_disaster": 0.0,
+                },
+                "labels": labels,
+            }
+        )
+    state["current_node"] = anchor_id
+    state["_temporary_route_edges"] = temporary_edges
+    return anchor_id
+
+
+def _interrupt_unit_for_replanning(
+    state: dict[str, Any], scenario: dict[str, Any], unit: dict[str, Any]
+) -> bool:
+    task = state.get("current_task")
+    if (
+        state["status"] not in {"en_route", "rescuing"}
+        or not task
+        or task.get("target_zone") is None
+        or int(state.get("onboard", 0)) > 0
+    ):
+        return False
+    _ensure_position_anchor(scenario, state, unit)
+    state["status"] = "idle"
+    state["current_task"] = None
+    state["remaining_travel"] = 0.0
+    state["remaining_service"] = 0.0
+    return True
 
 
 def _public_plan(
@@ -76,9 +331,14 @@ def _plan_idle_units(
 ) -> dict[str, Any]:
     assessments = assess_zones(scenario, network, model_name=model_name)
     active_zones = {
-        state["current_task"]["target_zone"]
+        state["current_task"].get("target_zone")
+        or state["current_task"].get("origin_zone")
         for state in states.values()
-        if state.get("current_task") and state["current_task"].get("target_zone")
+        if state.get("current_task")
+        and (
+            state["current_task"].get("target_zone")
+            or state["current_task"].get("origin_zone")
+        )
     }
     planning = deepcopy(scenario)
     planning["units"] = []
@@ -88,6 +348,10 @@ def _plan_idle_units(
             continue
         available = deepcopy(unit)
         available["start_node"] = state["current_node"]
+        if state.get("_temporary_route_edges"):
+            available["_temporary_route_edges"] = deepcopy(
+                state["_temporary_route_edges"]
+            )
         planning["units"].append(available)
     eligible_assessments = [
         assessment for assessment in assessments if assessment["zone_id"] not in active_zones
@@ -119,24 +383,85 @@ def _plan_idle_units(
     return _public_plan(assessments, states, matrix)
 
 
-def _invalidate_affected_missions(
-    states: dict[str, dict[str, Any]], event: dict[str, Any]
+def _reroute_returning_unit(
+    state: dict[str, Any],
+    scenario: dict[str, Any],
 ) -> None:
+    task = state.get("current_task") or {}
+    target_node = task.get("target_node") or scenario.get("hospital", {}).get("node_id")
+    if not target_node:
+        state["status"] = "stranded"
+        return
+    units = {unit["unit_id"]: unit for unit in scenario["units"]}
+    unit = units[state["unit_id"]]
+    start_node = _ensure_position_anchor(scenario, state, unit)
+    constraints = unit.get("constraints", {})
+    try:
+        route = risk_aware_astar(
+            _route_graph_for_unit(
+                [*scenario["roads"], *state.get("_temporary_route_edges", [])],
+                state["unit_id"],
+            ),
+            nodes=scenario.get("nodes"),
+            start=start_node,
+            goal=target_node,
+            speed=float(unit["speed"]),
+            risk_weights=scenario["config"]["weights"]["astar_risk"],
+            unit_type=unit["type"],
+            max_fire_risk=constraints.get("max_fire_risk"),
+            route_layer="ground",
+        )
+        route["risk_policy"] = "standard"
+        _hide_temporary_route_edges(route)
+    except NoRouteError:
+        try:
+            route = risk_aware_astar(
+                _route_graph_for_unit(
+                    [*scenario["roads"], *state.get("_temporary_route_edges", [])],
+                    state["unit_id"],
+                ),
+                nodes=scenario.get("nodes"),
+                start=start_node,
+                goal=target_node,
+                speed=float(unit["speed"]),
+                risk_weights=scenario["config"]["weights"]["astar_risk"],
+                unit_type=unit["type"],
+                max_fire_risk=None,
+                route_layer="ground",
+            )
+            route["risk_policy"] = "relaxed_fire_limit"
+            route["relaxed_constraints"] = ["max_fire_risk"]
+            _hide_temporary_route_edges(route)
+        except NoRouteError:
+            state["status"] = "stranded"
+            return
+    task["route"] = route
+    task["initial_eta"] = float(route["eta"])
+    state["remaining_travel"] = float(route["eta"])
+    state["current_task"] = task
+
+
+def _invalidate_affected_missions(
+    states: dict[str, dict[str, Any]], event: dict[str, Any], scenario: dict[str, Any]
+) -> None:
+    units = {unit["unit_id"]: unit for unit in scenario["units"]}
     if event["event_type"] != "road_collapse":
+        for state in states.values():
+            _interrupt_unit_for_replanning(state, scenario, units[state["unit_id"]])
         return
     collapsed_route = event["target_id"]
     for state in states.values():
         task = state.get("current_task")
         if (
-            state["status"] == "en_route"
+            state["status"] in {"en_route", "returning"}
             and task
             and task["route"].get("route_layer", "ground") == "ground"
             and collapsed_route in task["route"]["road_ids"]
         ):
-            state["status"] = "idle"
-            state["current_task"] = None
-            state["remaining_travel"] = 0.0
-            state["remaining_service"] = 0.0
+            if state["status"] == "returning":
+                _reroute_returning_unit(state, scenario)
+            else:
+                _interrupt_unit_for_replanning(state, scenario, units[state["unit_id"]])
 
 
 def run_pipeline(
@@ -176,7 +501,7 @@ def run_pipeline(
             advance_unit_states(states, elapsed, scenario)
             simulation_clock += elapsed
             scenario = normalize_scenario(apply_event(scenario, event))
-            _invalidate_affected_missions(states, event)
+            _invalidate_affected_missions(states, event, scenario)
             current_plan = _plan_idle_units(scenario, states, network, model_name)
             snapshot = {
                 "step": step,

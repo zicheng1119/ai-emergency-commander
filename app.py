@@ -20,7 +20,6 @@ EVENTS = (
     ("road_collapse", "道路坍塌", "切断活动路线"),
     ("fire_spread", "火势蔓延", "提高区域风险"),
     ("new_sos", "新增求救", "注入高置信 SOS"),
-    ("drone_update", "无人机情报", "更新道路观测"),
 )
 PHASE_LABELS = {
     "validate": ("01", "输入校验", "JSON Schema + 归一化"),
@@ -51,6 +50,37 @@ def _network_for(session: LiveSimulation) -> DiscreteBayesianNetwork | None:
     return load_learned_network() if session.model_name == "learned_cpt" else None
 
 
+@st.cache_data
+def learned_advantage_metrics() -> dict[str, float]:
+    aggregate = read_json(
+        ROOT / "artifacts" / "full_bayesian_experiment" / "experiment_metrics.json"
+    )["aggregate"]
+    expert_trapped = aggregate["expert_cpt"]["trapped_people"]
+    learned_trapped = aggregate["learned_cpt"]["trapped_people"]
+    expert_road = aggregate["expert_cpt"]["road_passable"]
+    learned_road = aggregate["learned_cpt"]["road_passable"]
+    return {
+        "trapped_f1_delta": learned_trapped["f1"] - expert_trapped["f1"],
+        "trapped_accuracy_delta": learned_trapped["accuracy"] - expert_trapped["accuracy"],
+        "road_auc_delta": learned_road["roc_auc"] - expert_road["roc_auc"],
+        "learned_trapped_f1": learned_trapped["f1"],
+        "expert_trapped_f1": expert_trapped["f1"],
+    }
+
+
+def _render_learned_advantage_panel() -> None:
+    metrics = learned_advantage_metrics()
+    st.markdown(
+        "<div class='learned-advantage'><b>学习 CPT 优势</b>"
+        f"<span>被困 F1 {metrics['learned_trapped_f1']:.3f} vs "
+        f"{metrics['expert_trapped_f1']:.3f}</span>"
+        f"<small>被困 F1 +{metrics['trapped_f1_delta']:.3f} · "
+        f"Accuracy +{metrics['trapped_accuracy_delta']:.3f} · "
+        f"道路 ROC-AUC +{metrics['road_auc_delta']:.3f}</small></div>",
+        unsafe_allow_html=True,
+    )
+
+
 def _load_session() -> LiveSimulation | None:
     payload = st.session_state.get("live_simulation")
     return LiveSimulation.from_dict(payload) if payload else None
@@ -59,6 +89,10 @@ def _load_session() -> LiveSimulation | None:
 def _save_session(session: LiveSimulation) -> None:
     st.session_state["live_simulation"] = session.to_dict()
     st.session_state["history_index"] = len(session.calculation_history) - 1
+
+
+def _event_target_key(event_type: str) -> str:
+    return f"event_target_{event_type}"
 
 
 def start_random_session() -> None:
@@ -97,7 +131,10 @@ def inject_event(event_type: str) -> None:
     session = _load_session()
     if session is None or not session.initial_plan or session.status != "running":
         return
-    event = session.inject_event(event_type)
+    targets = session.available_event_targets(event_type)
+    selected = st.session_state.get(_event_target_key(event_type))
+    target_id = selected if selected in targets else None
+    event = session.inject_event(event_type, target_id=target_id)
     _save_session(session)
     st.session_state["event_notice"] = event["description"]
 
@@ -192,6 +229,24 @@ def _render_inference(record: dict[str, Any]) -> None:
     zones = record["outputs"].get("zones", [])
     if not zones:
         return
+    comparison = record["outputs"].get("model_comparison", {})
+    if comparison:
+        active_model = comparison.get("active_model", "unknown")
+        baseline_model = comparison.get("baseline_model", "expert_cpt")
+        max_priority_delta = comparison.get("max_abs_priority_delta", 0.0)
+        model_note = (
+            "学习 CPT 正在替换贝叶斯条件概率表；优先级/效用权重保持相同，"
+            "因此差异来自后验概率。"
+            if active_model == "learned_cpt"
+            else "当前使用固定专家 CPT；下表作为专家基线自检，delta 应接近 0。"
+        )
+        st.markdown(
+            f"<div class='model-compare'><b>{html.escape(active_model.upper())}</b>"
+            f"<span>vs {html.escape(baseline_model.upper())}</span>"
+            f"<em>MAX |Δ priority| = {max_priority_delta:.3f}</em>"
+            f"<small>{html.escape(model_note)}</small></div>",
+            unsafe_allow_html=True,
+        )
     selected = st.selectbox(
         "查看区域",
         [zone["zone_id"] for zone in zones],
@@ -221,6 +276,19 @@ def _render_inference(record: dict[str, Any]) -> None:
         for item in zone["trapped_contributions"][:5]
     ]
     _compact_frame(contribution_rows, height=150)
+    if comparison:
+        _compact_frame(
+            [
+                {
+                    "区域": row["zone_id"],
+                    "Δ被困": row["trapped_delta"],
+                    "Δ通行": row["passability_delta"],
+                    "Δ优先级": row["priority_delta"],
+                }
+                for row in comparison.get("zones", [])
+            ],
+            height=165,
+        )
 
 
 def _render_priority(record: dict[str, Any]) -> None:
@@ -468,7 +536,15 @@ def _render_event_dock(session: LiveSimulation | None) -> None:
     )
     for event_type, label, hint in EVENTS:
         targets = session.available_event_targets(event_type) if enabled and session else []
-        target = session.select_event_target(event_type) if targets and session else "LOCKED"
+        default_target = session.select_event_target(event_type) if targets and session else "LOCKED"
+        selected = st.selectbox(
+            f"{label}目标",
+            targets or ["LOCKED"],
+            index=(targets.index(default_target) if targets and default_target in targets else 0),
+            key=_event_target_key(event_type),
+            disabled=not targets,
+            label_visibility="collapsed",
+        )
         st.button(
             label,
             key=f"event_{event_type}",
@@ -478,7 +554,7 @@ def _render_event_dock(session: LiveSimulation | None) -> None:
             args=(event_type,),
         )
         st.markdown(
-            f"<div class='event-meta'>{html.escape(hint)}<b>AUTO · {html.escape(target)}</b></div>",
+            f"<div class='event-meta'>{html.escape(hint)}<b>TARGET · {html.escape(selected)}</b></div>",
             unsafe_allow_html=True,
         )
 
@@ -573,6 +649,18 @@ h1 { font-size:1.42rem !important; margin:0 !important; line-height:1 !important
 .formula-box small,.alert-box small { display:block; color:#7f8b92; margin-top:4px; }
 .alert-box { border-left-color:var(--orange); }
 .alert-box b { color:var(--orange); }
+.model-compare { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; align-items:center;
+  background:#18232a; border:1px solid #3d4d55; border-left:4px solid var(--amber);
+  padding:9px 11px; margin:5px 0 8px; }
+.model-compare b { color:var(--amber); font-size:.82rem; }
+.model-compare span { color:#c8d1d4; font-size:.62rem; }
+.model-compare em { color:var(--cyan); font-style:normal; font-size:.65rem; }
+.model-compare small { grid-column:1 / -1; color:#89959b; font-size:.56rem; line-height:1.45; }
+.learned-advantage { margin-top:5px; border:1px solid #51442c; border-left:4px solid var(--amber);
+  background:#1b211d; padding:7px 8px; color:#f5ead4; line-height:1.35; }
+.learned-advantage b { color:var(--amber); display:block; font-size:.66rem; }
+.learned-advantage span { color:#dce4e5; display:block; font-size:.55rem; margin-top:2px; }
+.learned-advantage small { color:#9aa69c; display:block; font-size:.49rem; margin-top:2px; }
 .count-chip { display:inline-flex; flex-direction:column; min-width:66px; border:1px solid #3c474e;
   padding:7px 9px; margin:3px 4px 7px 0; color:#8f9aa0; font-size:.55rem; text-transform:uppercase; }
 .count-chip b { color:var(--cyan); font-size:1rem; }
@@ -623,7 +711,14 @@ with header_meta:
             unsafe_allow_html=True,
         )
 with model_col:
-    st.selectbox("概率模型", ["固定专家 CPT", "学习 CPT"], key="model_selector", label_visibility="collapsed")
+    selected_model = st.selectbox(
+        "概率模型",
+        ["固定专家 CPT", "学习 CPT"],
+        key="model_selector",
+        label_visibility="collapsed",
+    )
+    if selected_model == "学习 CPT":
+        _render_learned_advantage_panel()
 with generate_col:
     st.button(
         "生成复杂地图",

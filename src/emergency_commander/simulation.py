@@ -7,6 +7,16 @@ from typing import Any
 from emergency_commander.routing import NoRouteError, risk_aware_astar
 
 
+def _route_graph_for_unit(
+    route_graph: list[dict[str, Any]], unit_id: str
+) -> list[dict[str, Any]]:
+    return [
+        road
+        for road in route_graph
+        if road.get("labels", {}).get("unit_anchor") in {None, unit_id}
+    ]
+
+
 def initialize_unit_states(scenario: dict[str, Any]) -> dict[str, dict[str, Any]]:
     nodes = scenario.get("nodes", {})
     states = {}
@@ -74,6 +84,7 @@ def start_assignments(
             "route": route,
             "initial_eta": float(route["eta"]),
         }
+        state.pop("_temporary_route_edges", None)
 
 
 def _route_position(
@@ -118,7 +129,7 @@ def _start_return_to_hospital(
         return
     try:
         route = risk_aware_astar(
-            scenario["roads"],
+            _route_graph_for_unit(scenario["roads"], state["unit_id"]),
             nodes=scenario.get("nodes"),
             start=state["current_node"],
             goal=hospital,
@@ -142,6 +153,29 @@ def _start_return_to_hospital(
         "route": route,
         "initial_eta": float(route["eta"]),
     }
+
+
+def _complete_service_task(
+    state: dict[str, Any], scenario: dict[str, Any], unit: dict[str, Any]
+) -> None:
+    task = state["current_task"]
+    if task["mission_type"] == "reconnaissance":
+        if task.get("target_zone") is not None:
+            state["completed_targets"].append(task["target_zone"])
+        state["status"] = "idle"
+        state["current_task"] = None
+        state["completed_missions"] += 1
+        return
+
+    if task.get("target_zone") is not None:
+        state["completed_targets"].append(task["target_zone"])
+    state["onboard"] = min(state["capacity"], task["estimated_people"])
+    if state["onboard"]:
+        _start_return_to_hospital(state, scenario, unit)
+    else:
+        state["status"] = "idle"
+        state["current_task"] = None
+        state["completed_missions"] += 1
 
 
 def advance_unit_states(
@@ -186,6 +220,8 @@ def advance_unit_states(
                     state["completed_missions"] += 1
                 else:
                     state["status"] = "rescuing"
+                    if state["remaining_service"] <= 1e-9:
+                        _complete_service_task(state, scenario, unit)
             elif state["status"] == "rescuing":
                 service = float(state["remaining_service"])
                 consumed = min(remaining_time, service)
@@ -193,20 +229,4 @@ def advance_unit_states(
                 remaining_time -= consumed
                 if state["remaining_service"] > 1e-9:
                     break
-                task = state["current_task"]
-                if task["mission_type"] == "reconnaissance":
-                    if task.get("target_zone") is not None:
-                        state["completed_targets"].append(task["target_zone"])
-                    state["status"] = "idle"
-                    state["current_task"] = None
-                    state["completed_missions"] += 1
-                else:
-                    if task.get("target_zone") is not None:
-                        state["completed_targets"].append(task["target_zone"])
-                    state["onboard"] = min(state["capacity"], task["estimated_people"])
-                    if state["onboard"]:
-                        _start_return_to_hospital(state, scenario, unit)
-                    else:
-                        state["status"] = "idle"
-                        state["current_task"] = None
-                        state["completed_missions"] += 1
+                _complete_service_task(state, scenario, unit)

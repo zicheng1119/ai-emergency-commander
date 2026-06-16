@@ -112,14 +112,138 @@ def test_pipeline_replans_after_road_collapse():
     output = run_pipeline(scenario_with_collapse(), process_events=True)
 
     assert output["run_mode"] == "fixed"
-    assert output["routes"][0]["path"] == ["HQ", "X", "ZONE_A"]
+    assert output["routes"][0]["path"][0].startswith("__unit_RescueCar-1_position")
+    assert output["routes"][0]["path"][0] != "HQ"
     assert output["replan_log"][0]["trigger_event"]["event_type"] == "road_collapse"
     assert output["replan_log"][0]["old_plan"]["routes"][0]["path"] == ["HQ", "ZONE_A"]
-    assert output["replan_log"][0]["new_plan"]["routes"][0]["path"] == ["HQ", "X", "ZONE_A"]
+    assert output["replan_log"][0]["new_plan"]["routes"][0]["path"][0].startswith(
+        "__unit_RescueCar-1_position"
+    )
     assert output["simulation_clock"] == 1.0
     assert len(output["timeline"]) == 2
     assert output["timeline"][0]["unit_states"]["RescueCar-1"]["status"] == "en_route"
-    assert output["timeline"][1]["unit_states"]["RescueCar-1"]["current_node"] == "HQ"
+    assert output["timeline"][1]["unit_states"]["RescueCar-1"]["current_node"].startswith(
+        "__unit_RescueCar-1_position"
+    )
+    anchor_roads = [
+        road
+        for road in output["timeline"][1]["scenario_state"]["roads"]
+        if road.get("labels", {}).get("unit_anchor") == "RescueCar-1"
+    ]
+    assert anchor_roads == []
+    assert all(
+        not road_id.startswith("__unit_")
+        for road_id in output["routes"][0]["road_ids"]
+    )
+
+
+def scenario_with_higher_utility_sos(event_type="new_sos"):
+    scenario = scenario_with_collapse()
+    scenario["scenario_id"] = "high_utility_sos_case"
+    scenario["nodes"].update(
+        {
+            "ZONE_A": {"x": 10.0, "y": 0.0},
+            "ZONE_B": {"x": 2.0, "y": 1.0},
+        }
+    )
+    scenario["zones"] = [
+        {
+            "zone_id": "A",
+            "node_id": "ZONE_A",
+            "observations": {
+                "sos_signal": 0.75,
+                "building_collapse": 0.70,
+                "smoke": 0.20,
+                "fire": 0.20,
+                "road_damage": 0.10,
+                "human_activity": 0.65,
+                "congestion": 0.10,
+                "time_urgency": 0.70,
+                "drone_confidence": 0.0,
+            },
+        },
+        {
+            "zone_id": "B",
+            "node_id": "ZONE_B",
+            "observations": {
+                "sos_signal": 0.05,
+                "building_collapse": 0.05,
+                "smoke": 0.05,
+                "fire": 0.05,
+                "road_damage": 0.10,
+                "human_activity": 0.05,
+                "congestion": 0.05,
+                "time_urgency": 0.05,
+                "drone_confidence": 0.0,
+            },
+        },
+    ]
+    scenario["roads"] = [
+        {
+            "road_id": "to_a",
+            "from": "HQ",
+            "to": "ZONE_A",
+            "distance": 10.0,
+            "travel_time_base": 10.0,
+            "status": "open",
+            "risk": {"fire": 0.0, "damage": 0.0, "congestion": 0.0, "secondary_disaster": 0.0},
+        },
+        {
+            "road_id": "to_b",
+            "from": "HQ",
+            "to": "ZONE_B",
+            "distance": 2.3,
+            "travel_time_base": 2.3,
+            "status": "open",
+            "risk": {"fire": 0.0, "damage": 0.0, "congestion": 0.0, "secondary_disaster": 0.0},
+        },
+        {
+            "road_id": "hospital_hq",
+            "from": "HOSPITAL",
+            "to": "HQ",
+            "distance": 2.0,
+            "travel_time_base": 2.0,
+            "status": "open",
+            "risk": {"fire": 0.0, "damage": 0.0, "congestion": 0.0, "secondary_disaster": 0.0},
+        },
+    ]
+    scenario["events"] = [
+        {
+            "event_id": "EVT_SOS_B",
+            "event_type": event_type,
+            "trigger_step": 1,
+            "elapsed_minutes": 1.0,
+            "target_id": "B",
+            "changes": {
+                "observations.sos_signal": 1.0,
+                "observations.building_collapse": 1.0,
+                "observations.human_activity": 1.0,
+                "observations.fire": 0.65,
+                "observations.smoke": 0.95,
+                "observations.time_urgency": 1.0,
+                "observations.road_damage": 0.05,
+                "observations.congestion": 0.05,
+            },
+            "description": "B receives a high-confidence SOS",
+        }
+    ]
+    return scenario
+
+
+def test_emergency_zone_event_interrupts_car_for_higher_utility_zone():
+    for event_type in ("new_sos", "fire_spread", "drone_update"):
+        output = run_pipeline(
+            scenario_with_higher_utility_sos(event_type),
+            process_events=True,
+        )
+
+        assert output["replan_log"][0]["trigger_event"]["event_type"] == event_type
+        assert output["replan_log"][0]["old_plan"]["assignments"][0]["target_zone"] == "A"
+        assert output["assignments"][0]["target_zone"] == "B"
+        assert output["assignments"][0]["expected_utility"] > output["replan_log"][0][
+            "old_plan"
+        ]["assignments"][0]["expected_utility"]
+        assert output["routes"][0]["path"][0].startswith("__unit_RescueCar-1_position")
 
 
 def test_completed_drone_target_is_not_immediately_assigned_again():
